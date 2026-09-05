@@ -22,6 +22,8 @@ import Product from './Product';
 import Tenant from './Tenant';
 import SubBrand from './SubBrand';
 import UserTenant from './UserTenant';
+import GameLog from './GameLog';
+import GameLogSyncState from './GameLogSyncState';
 
 // User - Permission (Direct Many-to-Many - Deprecated but kept for compatibility if needed)
 User.belongsToMany(Permission, { through: UserPermission, foreignKey: 'userId', otherKey: 'permissionId' });
@@ -53,6 +55,14 @@ Transaction.belongsTo(BankAccount, { foreignKey: 'bank_account_id' });
 Transaction.belongsTo(User, { foreignKey: 'operator_id', as: 'operator' });
 Transaction.belongsTo(Game, { foreignKey: 'game_id' });
 Game.hasMany(Transaction, { foreignKey: 'game_id' });
+
+// Locally persisted vendor game history
+GameLog.belongsTo(Player, { foreignKey: 'player_id' });
+Player.hasMany(GameLog, { foreignKey: 'player_id' });
+GameLog.belongsTo(Game, { foreignKey: 'game_id' });
+Game.hasMany(GameLog, { foreignKey: 'game_id' });
+GameLogSyncState.belongsTo(Game, { foreignKey: 'game_id' });
+Game.hasOne(GameLogSyncState, { foreignKey: 'game_id' });
 
 // AuditLog - User (One-to-Many)
 User.hasMany(AuditLog, { foreignKey: 'userId' });
@@ -123,4 +133,6 @@ export {
   Tenant,
   SubBrand,
   UserTenant,
+  GameLog,
+  GameLogSyncState,
 };

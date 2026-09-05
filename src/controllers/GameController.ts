@@ -7,7 +7,14 @@ import { decrypt, encrypt, isEncrypted } from '../utils/encryption';
 import { VendorFieldDef, getVendorFieldDefsFromKeys, isAllowedVendorFieldKey } from '../vendors/vendorFieldRegistry';
 import { sendSuccess, sendError } from '../utils/response';
 import { getTenancyScopeOrThrow, withTenancyCreate, withTenancyWhere } from '../tenancy/scope';
-import { getCache, setCache } from '../services/CacheService';
+import { getCache, invalidateCacheByPrefix, setCache } from '../services/CacheService';
+import { Op } from 'sequelize';
+import {
+  cloneApiConfiguration,
+  getInheritedBrandApiConfiguration,
+  normalizeApiConfiguration,
+  withApiConfigurationForResponse,
+} from '../services/gameApiConfigurationPolicy';
 
 const isValidUrl = (url: string): boolean => {
   if (!url) return true; // Allow empty/null URLs
@@ -90,18 +97,7 @@ const maskSecretValue = (value: any): any => {
 };
 
 const normalizeVendorConfigRaw = (raw: any): Record<string, any> | null => {
-  if (raw === null || raw === undefined) return null;
-  if (typeof raw === 'string') {
-    const s = raw.trim();
-    if (!(s.startsWith('{') || s.startsWith('['))) return null;
-    try {
-      raw = JSON.parse(s);
-    } catch {
-      return null;
-    }
-  }
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
-  return raw as Record<string, any>;
+  return normalizeApiConfiguration(raw);
 };
 
 export const __test__ = {
@@ -195,6 +191,34 @@ const maskVendorConfigForResponse = (
   return out;
 };
 
+const isSuperAdminRequest = (req: AuthRequest): boolean => Boolean(req.user?.is_super_admin);
+
+const findBrandApiTemplate = async (
+  tenantId: number,
+  productId: number,
+  transaction?: any,
+): Promise<any | null> => {
+  const candidates = await Game.findAll({
+    where: {
+      tenant_id: tenantId,
+      product_id: productId,
+      status: 'active',
+      use_api: true,
+      vendor_config: { [Op.ne]: null },
+    } as any,
+    order: [['id', 'ASC']],
+    transaction,
+  } as any);
+  return (candidates as any[]).find((row) => cloneApiConfiguration((row as any).vendor_config) !== null) ?? null;
+};
+
+const invalidateGameCachesForTenant = (tenantId: number) => {
+  invalidateCacheByPrefix([
+    `games_context_v3:${tenantId}:`,
+    `game_detail_v2:${tenantId}:`,
+  ]);
+};
+
 export const getAllGames = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const scope = getTenancyScopeOrThrow(req);
@@ -226,6 +250,7 @@ export const getGamesContext = async (req: AuthRequest, res: Response): Promise<
     await ensureGamesSynced();
     const userPermissions = req.user?.permissions || [];
     const canViewGames = (userPermissions as string[]).includes('view:games');
+    const isSuperAdmin = isSuperAdminRequest(req);
     const includeMetaRaw =
       (req.query.includeMeta as string | undefined) ??
       (req.query.include_meta as string | undefined) ??
@@ -236,7 +261,14 @@ export const getGamesContext = async (req: AuthRequest, res: Response): Promise<
         : !['0', 'false', 'no'].includes(includeMetaRaw.trim().toLowerCase());
 
     const requesterId = req.user?.id ?? null;
-    const baseCacheKey = ['games_context_v2', scope.tenant_id, scope.sub_brand_id, includeMeta ? 'm1' : 'm0', canViewGames ? 'b1' : 'b0'].join(':');
+    const baseCacheKey = [
+      'games_context_v3',
+      scope.tenant_id,
+      scope.sub_brand_id,
+      includeMeta ? 'm1' : 'm0',
+      canViewGames ? 'b1' : 'b0',
+      isSuperAdmin ? 'a1' : 'a0',
+    ].join(':');
     const cached = getCache(baseCacheKey);
     if (cached) {
       res.setHeader('Cache-Control', 'private, max-age=3');
@@ -244,7 +276,7 @@ export const getGamesContext = async (req: AuthRequest, res: Response): Promise<
       return;
     }
 
-    const [games, products] = await Promise.all([
+    const [games, products, brandApiRows] = await Promise.all([
       Game.findAll({
         attributes: ['id', 'name', 'icon', 'status', 'balance', 'kioskUrl', 'kioskUsername', 'kioskPassword', 'product_id', 'use_api'],
         where: withTenancyWhere(scope, { status: 'active' }),
@@ -257,32 +289,66 @@ export const getGamesContext = async (req: AuthRequest, res: Response): Promise<
             order: [['provider', 'ASC']],
           } as any)
         : Promise.resolve([] as any[]),
+      includeMeta && isSuperAdmin
+        ? Game.findAll({
+            attributes: ['id', 'product_id', 'vendor_config'],
+            where: {
+              tenant_id: scope.tenant_id,
+              status: 'active',
+              use_api: true,
+              vendor_config: { [Op.ne]: null },
+            } as any,
+            order: [['id', 'ASC']],
+          } as any)
+        : Promise.resolve([] as any[]),
     ]);
 
-    const productMap = new Map<number, any>();
-    (products as any[]).forEach((p: any) => productMap.set(p.id, p));
+    const brandApiByProduct = new Map<number, any>();
+    (brandApiRows as any[]).forEach((row: any) => {
+      const productId = Number((row as any).product_id ?? null);
+      if (!Number.isFinite(productId) || productId <= 0 || brandApiByProduct.has(productId)) return;
+      if (cloneApiConfiguration((row as any).vendor_config) === null) return;
+      brandApiByProduct.set(productId, row);
+    });
 
     const formattedProducts = includeMeta
-      ? (products as any[]).map((p: any) => ({
-          id: p.id,
-          provider: p.provider,
-          providerCode: p.providerCode,
-          vendorFields: normalizeVendorFieldKeys(p.vendorFields),
-        }))
+      ? (products as any[]).map((p: any) => {
+          const base = {
+            id: p.id,
+            provider: p.provider,
+            providerCode: p.providerCode,
+          };
+          if (!isSuperAdmin) return base;
+
+          const vendorFieldKeys = normalizeVendorFieldKeys(p.vendorFields);
+          const vendorFields = getVendorFieldDefsFromKeys(vendorFieldKeys);
+          const template = brandApiByProduct.get(Number(p.id)) ?? null;
+          return {
+            ...base,
+            vendorFields: vendorFieldKeys,
+            brandApiConfigured: Boolean(template),
+            brandUseApi: Boolean(template),
+            brandVendorConfig: template
+              ? maskVendorConfigForResponse(vendorFields, (template as any).vendor_config)
+              : null,
+          };
+        })
       : [];
 
-    const formattedGames = (games as any[]).map((g: any) => ({
-      id: g.id,
-      name: g.name,
-      icon: g.icon,
-      status: g.status,
-      balance: canViewGames ? Number(g.balance) : null,
-      kioskUrl: g.kioskUrl,
-      kioskUsername: g.kioskUsername,
-      kioskPassword: g.kioskPassword,
-      productId: (g as any).product_id || null,
-      useApi: Boolean((g as any).use_api),
-    }));
+    const formattedGames = (games as any[]).map((g: any) => {
+      const base = {
+        id: g.id,
+        name: g.name,
+        icon: g.icon,
+        status: g.status,
+        balance: canViewGames ? Number(g.balance) : null,
+        kioskUrl: g.kioskUrl,
+        kioskUsername: g.kioskUsername,
+        kioskPassword: g.kioskPassword,
+        productId: (g as any).product_id || null,
+      };
+      return isSuperAdmin ? { ...base, useApi: Boolean((g as any).use_api) } : base;
+    });
 
     let subBrands: any[] = [];
     if (includeMeta) {
@@ -291,12 +357,12 @@ export const getGamesContext = async (req: AuthRequest, res: Response): Promise<
           ? await User.findByPk(requesterId, { include: [{ model: Role, through: { attributes: [] }, required: false }] } as any)
           : null;
         if (requester) {
-          const isSuperAdmin =
+          const requesterIsSuperAdmin =
             Boolean(req.user?.is_super_admin) ||
             Boolean((requester as any)?.Roles?.some((r: Role) => String((r as any)?.name).toLowerCase() === 'super admin'));
           const isOperator = Boolean((requester as any)?.Roles?.some((r: Role) => String((r as any)?.name).toLowerCase() === 'operator'));
           const isAgent = Boolean((requester as any)?.Roles?.some((r: Role) => String((r as any)?.name).toLowerCase() === 'agent'));
-          if (isSuperAdmin) {
+          if (requesterIsSuperAdmin) {
             subBrands = await SubBrand.findAll({ order: [['id', 'ASC']] });
           } else if (isOperator) {
             const tid = Number((requester as any)?.tenant_id ?? null);
@@ -349,6 +415,7 @@ export const getGameById = async (req: AuthRequest, res: Response): Promise<void
     const scope = getTenancyScopeOrThrow(req);
     const userPermissions = req.user?.permissions || [];
     const canViewGames = (userPermissions as string[]).includes('view:games');
+    const isSuperAdmin = isSuperAdminRequest(req);
     const idRaw = req.params.id;
     const id = idRaw != null ? Number(idRaw) : NaN;
     if (!Number.isFinite(id) || id <= 0) {
@@ -356,7 +423,14 @@ export const getGameById = async (req: AuthRequest, res: Response): Promise<void
       return;
     }
 
-    const cacheKey = ['game_detail_v1', scope.tenant_id, scope.sub_brand_id, id, canViewGames ? 'b1' : 'b0'].join(':');
+    const cacheKey = [
+      'game_detail_v2',
+      scope.tenant_id,
+      scope.sub_brand_id,
+      id,
+      canViewGames ? 'b1' : 'b0',
+      isSuperAdmin ? 'a1' : 'a0',
+    ].join(':');
     const cached = getCache(cacheKey);
     if (cached) {
       res.setHeader('Cache-Control', 'private, max-age=10');
@@ -371,12 +445,19 @@ export const getGameById = async (req: AuthRequest, res: Response): Promise<void
     }
 
     const productId = (game as any).product_id ? Number((game as any).product_id) : null;
-    const product = productId ? await Product.findByPk(productId) : null;
+    const product = isSuperAdmin && productId ? await Product.findByPk(productId) : null;
     const vendorFieldKeys = product ? normalizeVendorFieldKeys((product as any).vendorFields) : [];
     const vendorFields = getVendorFieldDefsFromKeys(vendorFieldKeys);
-    const maskedVendorConfig = product ? maskVendorConfigForResponse(vendorFields, (game as any).vendor_config) : null;
+    const brandTemplate = isSuperAdmin && productId
+      ? await findBrandApiTemplate(scope.tenant_id, productId)
+      : null;
+    const apiConfigSource = brandTemplate ?? game;
+    const apiUseApi = Boolean((apiConfigSource as any).use_api);
+    const maskedVendorConfig = product && apiUseApi
+      ? maskVendorConfigForResponse(vendorFields, (apiConfigSource as any).vendor_config)
+      : null;
 
-    const payload = {
+    const payload = withApiConfigurationForResponse({
       id: game.id,
       name: game.name,
       icon: game.icon,
@@ -386,9 +467,7 @@ export const getGameById = async (req: AuthRequest, res: Response): Promise<void
       kioskUsername: (game as any).kioskUsername,
       kioskPassword: (game as any).kioskPassword,
       productId: productId || null,
-      vendorConfig: maskedVendorConfig,
-      useApi: Boolean((game as any).use_api),
-    };
+    }, isSuperAdmin, apiUseApi, maskedVendorConfig);
 
     setCache(cacheKey, payload, 10);
     res.setHeader('Cache-Control', 'private, max-age=10');
@@ -399,27 +478,31 @@ export const getGameById = async (req: AuthRequest, res: Response): Promise<void
 };
 
 export const createGame = async (req: AuthRequest, res: Response): Promise<void> => {
+  let transaction: any = null;
   try {
     const scope = getTenancyScopeOrThrow(req);
     await ensureGamesSynced();
+    transaction = await sequelize.transaction();
+    const isSuperAdmin = isSuperAdminRequest(req);
     const { balance, kioskUrl, kioskUsername, kioskPassword } = req.body;
     const productId = req.body?.productId !== undefined ? Number(req.body.productId) : null;
-    const useApi = Boolean(req.body?.useApi);
-    const vendorConfig = req.body?.vendorConfig;
     
     if (productId === null || Number.isNaN(productId)) {
+      await transaction.rollback();
       sendError(res, 'Code1002', 400); // Invalid product ID
       return;
     }
 
     // Validate kioskUrl if provided
     if (kioskUrl && !isValidUrl(kioskUrl)) {
+      await transaction.rollback();
       sendError(res, 'Code1003', 400); // Invalid URL
       return;
     }
 
-    const resolvedProduct = await Product.findByPk(productId);
+    const resolvedProduct = await Product.findByPk(productId, { transaction } as any);
     if (!resolvedProduct || resolvedProduct.status !== 'active') {
+      await transaction.rollback();
       sendError(res, 'Code1004', 400); // Product not found or inactive
       return;
     }
@@ -429,102 +512,44 @@ export const createGame = async (req: AuthRequest, res: Response): Promise<void>
 
     const existing = await Game.findOne({
       where: withTenancyWhere(scope, { name: trimmedName }),
+      transaction,
+      lock: transaction.LOCK.UPDATE,
     } as any);
 
-    if (existing) {
-      if (existing.status === 'inactive') {
-        const original = {
-          id: existing.id,
-          name: existing.name,
-          balance: Number(existing.balance),
-          icon: existing.icon,
-          status: existing.status,
-          kioskUrl: existing.kioskUrl,
-          kioskUsername: existing.kioskUsername,
-          kioskPassword: existing.kioskPassword,
-        };
-
-        let maskedVendorConfig: Record<string, any> | null = null;
-        (existing as any).product_id = resolvedProduct.id;
-        existing.name = trimmedName;
-        existing.icon = derivedIcon;
-        (existing as any).use_api = useApi;
-
-        if (useApi) {
-          const vendorFields = getVendorFieldDefsFromKeys(normalizeVendorFieldKeys(resolvedProduct.vendorFields));
-          const built = validateAndBuildVendorConfig(vendorFields, vendorConfig, 'create', null);
-          if (built.error) {
-            sendError(res, 'Code1005', 400, { detail: built.error }); // Built error
-            return;
-          }
-
-          (existing as any).vendor_config = built.config;
-          maskedVendorConfig = maskVendorConfigForResponse(vendorFields, built.config);
-        } else {
-          (existing as any).vendor_config = null;
-        }
-
-        // 用当前「添加游戏」表单中的数据覆盖余额和图标
-        if (balance !== undefined && balance !== null) {
-          (existing as any).balance = balance;
-        }
-        if (kioskUrl !== undefined) {
-          (existing as any).kioskUrl = kioskUrl;
-        }
-        if (kioskUsername !== undefined) {
-          (existing as any).kioskUsername = kioskUsername;
-        }
-        if (kioskPassword !== undefined) {
-          (existing as any).kioskPassword = kioskPassword;
-        }
-        existing.status = 'active';
-
-        await existing.save();
-
-        await logAudit(
-          req.user?.id || null,
-          'GAME_RESTORE',
-          original,
-          {
-            id: existing.id,
-            name: existing.name,
-            balance: Number(existing.balance),
-            icon: existing.icon,
-            status: existing.status,
-            kioskUrl: existing.kioskUrl,
-            kioskUsername: existing.kioskUsername,
-            kioskPassword: existing.kioskPassword,
-          },
-          getClientIp(req) || undefined,
-        );
-
-        sendSuccess(res, 'Code1', {
-          id: existing.id,
-          name: existing.name,
-          balance: Number(existing.balance),
-          icon: existing.icon,
-          status: existing.status,
-          kioskUrl: existing.kioskUrl,
-          kioskUsername: existing.kioskUsername,
-          kioskPassword: existing.kioskPassword,
-          productId: (existing as any).product_id || null,
-          vendorConfig: maskedVendorConfig,
-          useApi: Boolean((existing as any).use_api),
-        });
-        return;
-      }
-
+    if (existing && existing.status !== 'inactive') {
+      await transaction.rollback();
       sendError(res, 'Code1006', 400); // Game already exists
       return;
     }
 
-    let storedVendorConfig: Record<string, any> | null = null;
+    const brandTemplate = await findBrandApiTemplate(scope.tenant_id, resolvedProduct.id, transaction);
+    const inherited = getInheritedBrandApiConfiguration(brandTemplate);
+    const inheritedConfig = inherited.vendorConfig;
+    let useApi = inherited.useApi;
+    let storedVendorConfig: Record<string, any> | null = inheritedConfig;
     let maskedVendorConfig: Record<string, any> | null = null;
 
-    if (useApi) {
+    // API fields from non-superadmins are intentionally ignored; the brand template is authoritative.
+    if (isSuperAdmin) {
+      const requestedUseApi = Object.prototype.hasOwnProperty.call(req.body ?? {}, 'useApi')
+        ? Boolean(req.body?.useApi)
+        : useApi;
+      useApi = requestedUseApi;
+      if (!useApi) {
+        storedVendorConfig = null;
+      }
+    }
+
+    if (isSuperAdmin && useApi) {
       const vendorFields = getVendorFieldDefsFromKeys(normalizeVendorFieldKeys(resolvedProduct.vendorFields));
-      const built = validateAndBuildVendorConfig(vendorFields, vendorConfig, 'create', null);
+      const built = validateAndBuildVendorConfig(
+        vendorFields,
+        req.body?.vendorConfig,
+        inheritedConfig ? 'update' : 'create',
+        inheritedConfig,
+      );
       if (built.error) {
+        await transaction.rollback();
         sendError(res, 'Code1005', 400, { detail: built.error }); // Built error
         return;
       }
@@ -532,22 +557,56 @@ export const createGame = async (req: AuthRequest, res: Response): Promise<void>
       maskedVendorConfig = maskVendorConfigForResponse(vendorFields, storedVendorConfig);
     }
 
-    const game = await Game.create(withTenancyCreate(scope, {
-      name: trimmedName,
-      balance: balance || 0,
-      icon: derivedIcon,
-      kioskUrl,
-      kioskUsername,
-      kioskPassword,
-      product_id: resolvedProduct.id,
-      vendor_config: storedVendorConfig,
-      use_api: useApi,
-      status: 'active'
-    }));
+    let game: any;
+    let original: Record<string, any> | null = null;
+    let auditAction = 'GAME_CREATE';
+    if (existing) {
+      original = existing.toJSON();
+      auditAction = 'GAME_RESTORE';
+      (existing as any).product_id = resolvedProduct.id;
+      existing.name = trimmedName;
+      existing.icon = derivedIcon;
+      (existing as any).use_api = useApi;
+      (existing as any).vendor_config = storedVendorConfig;
+      if (balance !== undefined && balance !== null) (existing as any).balance = balance;
+      if (kioskUrl !== undefined) (existing as any).kioskUrl = kioskUrl;
+      if (kioskUsername !== undefined) (existing as any).kioskUsername = kioskUsername;
+      if (kioskPassword !== undefined) (existing as any).kioskPassword = kioskPassword;
+      existing.status = 'active';
+      await existing.save({ transaction });
+      game = existing;
+    } else {
+      game = await Game.create(withTenancyCreate(scope, {
+        name: trimmedName,
+        balance: balance ?? 0,
+        icon: derivedIcon,
+        kioskUrl,
+        kioskUsername,
+        kioskPassword,
+        product_id: resolvedProduct.id,
+        vendor_config: storedVendorConfig,
+        use_api: useApi,
+        status: 'active',
+      }), { transaction } as any);
+    }
+
+    if (isSuperAdmin) {
+      await Game.update(
+        { use_api: useApi, vendor_config: useApi ? storedVendorConfig : null } as any,
+        {
+          where: { tenant_id: scope.tenant_id, product_id: resolvedProduct.id } as any,
+          transaction,
+        },
+      );
+    }
+
+    await transaction.commit();
+    invalidateGameCachesForTenant(scope.tenant_id);
+
     await logAudit(
       req.user?.id || null,
-      'GAME_CREATE',
-      null,
+      auditAction,
+      original,
       {
         id: game.id,
         name: game.name,
@@ -561,7 +620,8 @@ export const createGame = async (req: AuthRequest, res: Response): Promise<void>
       },
       getClientIp(req) || undefined,
     );
-    sendSuccess(res, 'Code1007', {
+
+    const payload = withApiConfigurationForResponse({
       id: game.id,
       name: game.name,
       balance: Number(game.balance),
@@ -571,10 +631,10 @@ export const createGame = async (req: AuthRequest, res: Response): Promise<void>
       kioskUsername: game.kioskUsername,
       kioskPassword: game.kioskPassword,
       productId: (game as any).product_id || null,
-      vendorConfig: maskedVendorConfig,
-      useApi: Boolean((game as any).use_api),
-    }, undefined, 201); // Created successfully, mapped to generic Code1007 success could be just Code1 for creation. We use Code1.
+    }, isSuperAdmin, useApi, maskedVendorConfig);
+    sendSuccess(res, existing ? 'Code1' : 'Code1007', payload, undefined, existing ? 200 : 201);
   } catch (error) {
+    if (transaction && !transaction.finished) await transaction.rollback();
     console.error('Error creating game:', error);
     sendError(res, 'Code1007', 500); // Error creating game
   }
@@ -609,6 +669,7 @@ export const deleteGame = async (req: AuthRequest, res: Response): Promise<void>
 
     game.status = 'inactive';
     await game.save();
+    invalidateGameCachesForTenant(scope.tenant_id);
 
     await logAudit(
       req.user?.id || null,
@@ -634,28 +695,57 @@ export const deleteGame = async (req: AuthRequest, res: Response): Promise<void>
 };
 
 export const update = async (req: AuthRequest, res: Response): Promise<void> => {
+  let transaction: any = null;
   try {
     const scope = getTenancyScopeOrThrow(req);
     await ensureGamesSynced();
+    transaction = await sequelize.transaction();
+    const isSuperAdmin = isSuperAdminRequest(req);
     const { id } = req.params;
     const { kioskUrl, kioskUsername, kioskPassword } = req.body;
     const nextProductIdRaw = req.body?.productId;
     const nextVendorConfigRaw = req.body?.vendorConfig;
     const nextUseApiRaw = req.body?.useApi;
     
-    const game = await Game.findOne({ where: withTenancyWhere(scope, { id: Number(id) }) } as any);
+    const game = await Game.findOne({
+      where: withTenancyWhere(scope, { id: Number(id) }),
+      transaction,
+      lock: transaction.LOCK.UPDATE,
+    } as any);
     if (!game) {
+      await transaction.rollback();
       sendError(res, 'Code1008', 404); // Game not found
       return;
     }
 
     // Validate kioskUrl if provided
     if (kioskUrl !== undefined && kioskUrl !== null && kioskUrl !== '' && !isValidUrl(kioskUrl)) {
+      await transaction.rollback();
       sendError(res, 'Code1003', 400); // Invalid URL
       return;
     }
 
     const original = game.toJSON();
+    const currentProductId = (game as any).product_id ? Number((game as any).product_id) : null;
+    const nextProductId = nextProductIdRaw === undefined
+      ? currentProductId
+      : nextProductIdRaw === null
+        ? null
+        : Number(nextProductIdRaw);
+    if (nextProductId !== null && (!Number.isFinite(nextProductId) || nextProductId <= 0)) {
+      await transaction.rollback();
+      sendError(res, 'Code1004', 400);
+      return;
+    }
+    const productIdChanged = nextProductId !== currentProductId;
+    const product = nextProductId
+      ? await Product.findByPk(nextProductId, { transaction } as any)
+      : null;
+    if (nextProductId && (!product || product.status !== 'active')) {
+      await transaction.rollback();
+      sendError(res, 'Code1004', 400);
+      return;
+    }
     
     // Update all provided fields (including empty strings to clear values)
     if (kioskUrl !== undefined) {
@@ -667,97 +757,71 @@ export const update = async (req: AuthRequest, res: Response): Promise<void> => 
     if (kioskPassword !== undefined) {
       game.kioskPassword = kioskPassword;
     }
-    if (nextUseApiRaw !== undefined) {
-      (game as any).use_api = Boolean(nextUseApiRaw);
-    }
 
+    let useApi = Boolean((game as any).use_api);
+    let storedVendorConfig = cloneApiConfiguration((game as any).vendor_config);
     let maskedVendorConfig: Record<string, any> | null = null;
-    const productIdChanged =
-      nextProductIdRaw !== undefined &&
-      Number(nextProductIdRaw) !== Number((game as any).product_id || 0);
 
-    if (nextProductIdRaw !== undefined) {
-      const nextProductId = nextProductIdRaw === null ? null : Number(nextProductIdRaw);
-      if (nextProductId !== null && Number.isNaN(nextProductId)) {
-        sendError(res, 'Code1004', 400); // Product not found
-        return;
-      }
+    if (nextProductId === null) {
+      useApi = false;
+      storedVendorConfig = null;
+      (game as any).product_id = null;
+    } else {
+      (game as any).product_id = nextProductId;
+      game.name = String((product as any).provider).trim();
+      game.icon = (product as any).icon || null;
 
-      if (nextProductId === null) {
-        (game as any).product_id = null;
-        (game as any).vendor_config = null;
-        game.name = game.name;
-        game.icon = game.icon;
-      } else {
-        const product = await Product.findByPk(nextProductId);
-        if (!product || product.status !== 'active') {
-          sendError(res, 'Code1004', 400); // Product not found or inactive
-          return;
-        }
-        (game as any).product_id = product.id;
-        game.name = String(product.provider).trim();
-        game.icon = product.icon || null;
+      if (isSuperAdmin) {
+        const brandTemplate = await findBrandApiTemplate(scope.tenant_id, nextProductId, transaction);
+        const brandConfig = brandTemplate ? cloneApiConfiguration((brandTemplate as any).vendor_config) : null;
+        const existingConfig = brandConfig ?? (!productIdChanged ? storedVendorConfig : null);
+        useApi = nextUseApiRaw !== undefined
+          ? Boolean(nextUseApiRaw)
+          : Boolean(brandTemplate || (!productIdChanged && (game as any).use_api));
 
-        const useApi = Boolean((game as any).use_api);
         if (useApi) {
-          const vendorFields = getVendorFieldDefsFromKeys(normalizeVendorFieldKeys(product.vendorFields));
-          const existingCfg =
-            !productIdChanged && (game as any).vendor_config && typeof (game as any).vendor_config === 'object'
-              ? ((game as any).vendor_config as Record<string, any>)
-              : null;
-
+          const vendorFields = getVendorFieldDefsFromKeys(normalizeVendorFieldKeys((product as any).vendorFields));
           const built = validateAndBuildVendorConfig(
             vendorFields,
             nextVendorConfigRaw,
-            productIdChanged ? 'create' : 'update',
-            existingCfg,
+            existingConfig ? 'update' : 'create',
+            existingConfig,
           );
           if (built.error) {
-            sendError(res, 'Code1005', 400, { detail: built.error }); // Validation error
+            await transaction.rollback();
+            sendError(res, 'Code1005', 400, { detail: built.error });
             return;
           }
-          (game as any).vendor_config = built.config;
+          storedVendorConfig = built.config;
           maskedVendorConfig = maskVendorConfigForResponse(vendorFields, built.config);
         } else {
-          (game as any).vendor_config = null;
+          storedVendorConfig = null;
         }
+      } else if (productIdChanged) {
+        // Non-superadmins may change operational game data, but API settings always come from the brand.
+        const brandTemplate = await findBrandApiTemplate(scope.tenant_id, nextProductId, transaction);
+        const inherited = getInheritedBrandApiConfiguration(brandTemplate);
+        useApi = inherited.useApi;
+        storedVendorConfig = inherited.vendorConfig;
       }
-    } else if (nextVendorConfigRaw !== undefined) {
-      const productId = (game as any).product_id;
-      if (!productId) {
-        sendError(res, 'Code1004', 400); // Product not found
-        return;
-      }
-      const product = await Product.findByPk(Number(productId));
-      if (!product || product.status !== 'active') {
-        sendError(res, 'Code1004', 400); // Product not found
-        return;
-      }
-      const useApi = Boolean((game as any).use_api);
-      if (useApi) {
-        const vendorFields = getVendorFieldDefsFromKeys(normalizeVendorFieldKeys(product.vendorFields));
-        const existingCfg =
-          (game as any).vendor_config && typeof (game as any).vendor_config === 'object'
-            ? ((game as any).vendor_config as Record<string, any>)
-            : null;
-        const built = validateAndBuildVendorConfig(vendorFields, nextVendorConfigRaw, 'update', existingCfg);
-        if (built.error) {
-          sendError(res, 'Code1005', 400, { detail: built.error }); // Validation error
-          return;
-        }
-        (game as any).vendor_config = built.config;
-        maskedVendorConfig = maskVendorConfigForResponse(vendorFields, built.config);
-      } else {
-        (game as any).vendor_config = null;
-      }
-    }
-    
-    if (nextUseApiRaw !== undefined && !Boolean((game as any).use_api)) {
-      (game as any).vendor_config = null;
-      maskedVendorConfig = null;
     }
 
-    await game.save();
+    (game as any).use_api = useApi;
+    (game as any).vendor_config = useApi ? storedVendorConfig : null;
+    await game.save({ transaction });
+
+    if (isSuperAdmin && nextProductId !== null) {
+      await Game.update(
+        { use_api: useApi, vendor_config: useApi ? storedVendorConfig : null } as any,
+        {
+          where: { tenant_id: scope.tenant_id, product_id: nextProductId } as any,
+          transaction,
+        },
+      );
+    }
+
+    await transaction.commit();
+    invalidateGameCachesForTenant(scope.tenant_id);
 
     await logAudit(
       req.user?.id || null,
@@ -767,7 +831,7 @@ export const update = async (req: AuthRequest, res: Response): Promise<void> => 
       getClientIp(req) || undefined,
     );
 
-    sendSuccess(res, 'Code1', {
+    const payload = withApiConfigurationForResponse({
       id: game.id,
       name: game.name,
       icon: game.icon,
@@ -777,10 +841,10 @@ export const update = async (req: AuthRequest, res: Response): Promise<void> => 
       kioskUsername: game.kioskUsername,
       kioskPassword: game.kioskPassword,
       productId: (game as any).product_id || null,
-      vendorConfig: maskedVendorConfig,
-      useApi: Boolean((game as any).use_api),
-    });
+    }, isSuperAdmin, useApi, maskedVendorConfig);
+    sendSuccess(res, 'Code1', payload);
   } catch (error) {
+    if (transaction && !transaction.finished) await transaction.rollback();
     console.error('Error updating game:', error);
     sendError(res, 'Code1011', 500); // Error updating game
   }

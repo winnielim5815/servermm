@@ -2,12 +2,13 @@ import { Response } from 'express';
 import { Op, QueryTypes } from 'sequelize';
 import sequelize from '../config/database';
 import { AuthRequest } from '../middleware/auth';
-import { Game, Player, Product, Role, SubBrand, Transaction, User, UserTenant } from '../models';
+import { Game, GameLog, Player, Product, Role, SubBrand, Transaction, User, UserTenant } from '../models';
 import { VendorFactory } from '../services/vendor/VendorFactory';
 import { getTenancyScopeOrThrow, withTenancyWhere } from '../tenancy/scope';
 import { sendError, sendSuccess } from '../utils/response';
 import { getClientIp, logAudit } from '../services/AuditService';
 import { getCache, setCache } from '../services/CacheService';
+import { getGameLogSyncSummary, syncGameLogsForScope } from '../services/GameLogSyncService';
 
 let reportTransactionsSynced = false;
 const ensureReportTransactionsSynced = async () => {
@@ -114,6 +115,14 @@ const toDisplayDateTimeFromIso = (raw: any) => {
   const d = new Date(s);
   if (Number.isNaN(d.getTime())) return null;
   return toYmdHmsInTz8(d);
+};
+
+const toDisplayDateTimeFromStoredTz8 = (raw: any) => {
+  if (typeof raw === 'string') {
+    const match = raw.trim().match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})/);
+    if (match) return `${match[1]} ${match[2]}`;
+  }
+  return toDisplayDateTimeFromIso(raw);
 };
 
 const resolveVendorServiceForScope = async (scope: any, gameId: number | null, capability: 'winloss' | 'transactions') => {
@@ -848,8 +857,7 @@ export const getPlayerWinLossReport = async (req: AuthRequest, res: Response): P
 export const getPlayerGameLogReport = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const scope = getTenancyScopeOrThrow(req);
-    const { startDate, endDate, gameId, username } = req.query as any;
-
+    const { startDate, endDate, gameId, username, page, pageSize, refresh } = req.query as any;
     if (!startDate || !endDate) {
       sendError(res, 'Code9004', 400);
       return;
@@ -857,16 +865,11 @@ export const getPlayerGameLogReport = async (req: AuthRequest, res: Response): P
 
     const start = parseDateParam(String(startDate));
     const end = parseDateParam(String(endDate));
-    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end.getTime() <= start.getTime()) {
       sendError(res, 'Code9004', 400);
       return;
     }
-    if (end.getTime() <= start.getTime()) {
-      sendError(res, 'Code9004', 400);
-      return;
-    }
-    const maxRangeMs = 30 * 24 * 60 * 60 * 1000;
-    if (end.getTime() - start.getTime() > maxRangeMs) {
+    if (end.getTime() - start.getTime() > 30 * 24 * 60 * 60 * 1000) {
       sendError(res, 'Code9004', 400, { detail: 'player_game_log_range_exceeds_30d' });
       return;
     }
@@ -874,351 +877,139 @@ export const getPlayerGameLogReport = async (req: AuthRequest, res: Response): P
     const gid = gameId != null && String(gameId).trim().length > 0 ? Number(gameId) : null;
     const normalizedGameId = gid && Number.isFinite(gid) && gid > 0 ? gid : null;
     const uname = typeof username === 'string' ? username.trim() : '';
-    const gameLogCacheKey = [
-      'player_game_log_v1',
-      scope.tenant_id,
-      scope.sub_brand_id,
-      start.toISOString(),
-      end.toISOString(),
-      normalizedGameId ?? '',
-      uname || '',
-    ].join(':');
-    const cached = getCache(gameLogCacheKey);
-    if (cached) {
-      res.setHeader('Cache-Control', 'private, max-age=3');
-      sendSuccess(res, 'Code1', cached);
-      return;
-    }
+    const pageNumber = Math.max(1, Number.parseInt(String(page ?? '1'), 10) || 1);
+    const pageSizeNumber = Math.max(1, Math.min(200, Number.parseInt(String(pageSize ?? '50'), 10) || 50));
 
-    const mkWindowEnd = (ws: Date) => {
-      const ms = ws.getTime() + 24 * 60 * 60 * 1000;
-      return new Date(Math.min(ms, end.getTime()));
-    };
-    const rows: any[] = [];
-    let hasMore = false;
-    const vendorSummary = new Map<
-      string,
-      {
-        calls: number;
-        errors: number;
-        httpStatus: number | null;
-        status: string | null;
-        message: string | null;
-      }
-    >();
-
-    const updateVendorSummary = (providerLabel: string, resp: any) => {
-      const prev = vendorSummary.get(providerLabel) || {
-        calls: 0,
-        errors: 0,
-        httpStatus: null as number | null,
-        status: null as string | null,
-        message: null as string | null,
-      };
-
-      const raw = resp?.raw && typeof resp.raw === 'object' ? resp.raw : null;
-      const httpStatus =
-        raw && raw.httpStatus != null && Number.isFinite(Number(raw.httpStatus)) ? Number(raw.httpStatus) : null;
-      const status =
-        raw && raw.data && typeof raw.data === 'object'
-          ? typeof (raw.data as any).Status === 'string'
-            ? String((raw.data as any).Status)
-            : typeof (raw.data as any).status === 'string'
-              ? String((raw.data as any).status)
-              : null
-          : null;
-      const message =
-        typeof raw?.message === 'string' && raw.message.trim().length > 0
-          ? raw.message.trim()
-          : typeof raw?.error === 'string' && raw.error.trim().length > 0
-            ? raw.error.trim()
-            : typeof resp?.message === 'string' && resp.message.trim().length > 0
-              ? resp.message.trim()
-              : typeof resp?.error === 'string' && resp.error.trim().length > 0
-                ? resp.error.trim()
-                : null;
-
-      vendorSummary.set(providerLabel, {
-        calls: prev.calls + 1,
-        errors: prev.errors + (resp?.success ? 0 : 1),
-        httpStatus: httpStatus ?? prev.httpStatus,
-        status: status ?? prev.status,
-        message: message ?? prev.message,
-      });
-    };
-
-    const serviceEntries: Array<{ gameId: number; providerLabel: string; service: any }> = [];
     if (normalizedGameId) {
-      const g = await Game.findOne({
-        attributes: ['id', 'name', 'product_id'],
+      const selectedGame = await Game.findOne({
+        attributes: ['id'],
         where: withTenancyWhere(scope, { id: normalizedGameId } as any),
+        raw: true,
       } as any);
-      if (!g) {
+      if (!selectedGame) {
         sendError(res, 'Code9004', 400);
         return;
       }
+    }
 
-      if (uname) {
-        const p = await Player.findOne({
-          attributes: ['id'],
-          where: withTenancyWhere(scope, { player_game_id: uname } as any),
-          raw: true,
-        } as any);
-        if (!p) {
-          sendSuccess(res, 'Code1', { username: uname, rows: [], hasMore: false });
-          return;
-        }
-      }
-
-      const service = await resolveVendorServiceForScope(scope, normalizedGameId, 'transactions');
-      if (!service || typeof (service as any).getTransactionsByMinute !== 'function') {
-        sendError(res, 'Code9004', 400, { detail: 'player_game_log_vendor_not_supported' });
-        return;
-      }
-      const productId = Number((g as any).product_id ?? 0) || 0;
-      const product = productId ? await Product.findByPk(productId as any) : null;
-      const providerLabel = String((product as any)?.provider ?? (g as any).name ?? 'Vendor');
-      serviceEntries.push({ gameId: (g as any).id, providerLabel, service });
-    } else {
-      const candidates = await Game.findAll({
-        attributes: ['id', 'name', 'product_id'],
-        where: withTenancyWhere(scope, { use_api: true, status: 'active' } as any),
-        limit: 30,
-      } as any);
-      const maxServices = 10;
-      for (const c of candidates as any[]) {
-        if (serviceEntries.length >= maxServices) break;
-        const id = Number(c?.id ?? null);
-        if (!Number.isFinite(id) || id <= 0) continue;
-        const service = await resolveVendorServiceForScope(scope, id, 'transactions');
-        if (!service || typeof (service as any).getTransactionsByMinute !== 'function') continue;
-        const productId = Number(c?.product_id ?? 0) || 0;
-        const product = productId ? await Product.findByPk(productId as any) : null;
-        const providerLabel = String((product as any)?.provider ?? c?.name ?? 'Vendor');
-        serviceEntries.push({ gameId: id, providerLabel, service });
-      }
-      if (serviceEntries.length === 0) {
-        sendSuccess(res, 'Code1', { username: uname || null, rows: [] });
-        return;
+    const shouldRefresh = String(refresh ?? 'true').trim().toLowerCase() !== 'false';
+    let manualSyncFailed = false;
+    if (shouldRefresh) {
+      try {
+        const results = await syncGameLogsForScope(scope, normalizedGameId);
+        manualSyncFailed = results.some((result) => !result.success);
+      } catch {
+        manualSyncFailed = true;
       }
     }
 
-    const maxPages = 200;
-    const maxRows = 200000;
-    const maxApiCalls = 1200;
-    let apiCalls = 0;
-    const seen = new Set<string>();
-    for (const entry of serviceEntries) {
-      const gameInfoByCode = new Map<string, { name: string; type: string }>();
-      let windowStart = new Date(start.getTime());
-      while (windowStart.getTime() < end.getTime()) {
-        const windowEnd = mkWindowEnd(windowStart);
-        const startStr = toYmdHmInTz8(windowStart);
-        const endStr = toYmdHmInTz8(windowEnd);
+    const where: any = withTenancyWhere(scope, {
+      occurred_at: { [Op.between]: [start, end] },
+    } as any);
+    if (normalizedGameId) where.game_id = normalizedGameId;
+    if (uname) where.player = uname;
 
-        let nextId = '';
-        let pages = 0;
-        let lastRequestNextId = '';
-        while (pages < maxPages) {
-          lastRequestNextId = nextId;
-          apiCalls += 1;
-          if (apiCalls > maxApiCalls) {
-            hasMore = true;
-            break;
-          }
-          const resp = await (entry.service as any).getTransactionsByMinute(startStr, endStr, { nextId });
-          updateVendorSummary(entry.providerLabel, resp);
-          if (!resp?.success) {
-            await logAudit(
-              req.user?.id ?? null,
-              'GAME_LOG_QUERY_RESULT',
-              null,
-              {
-                username: uname || null,
-                rows: 0,
-                hasMore: true,
-                apiCalls,
-                vendors: Array.from(vendorSummary.entries()).map(([provider, v]) => ({ provider, ...v })),
-                error: resp?.error || resp?.message || 'Failed to get vendor transactions',
-              },
-              getClientIp(req),
-              { tenant_id: (scope as any)?.tenant_id ?? null, sub_brand_id: (scope as any)?.sub_brand_id ?? null },
-            );
-            sendError(res, 'Code9000', 500, { detail: resp?.error || resp?.message || 'Failed to get vendor transactions' });
-            return;
-          }
+    const [result, totalsRow, syncSummary] = await Promise.all([
+      GameLog.findAndCountAll({
+        where,
+        attributes: [
+          'id',
+          'player',
+          'game_id',
+          'vendor_transaction_id',
+          'round_id',
+          'game_code',
+          'game_provider',
+          'game_name',
+          'game_category',
+          'start_balance',
+          'end_balance',
+          'amount',
+          'result_amount',
+          'occurred_at',
+        ],
+        order: [['occurred_at', 'DESC'], ['id', 'DESC']],
+        offset: (pageNumber - 1) * pageSizeNumber,
+        limit: pageSizeNumber,
+        raw: true,
+      } as any),
+      GameLog.findOne({
+        where,
+        attributes: [
+          [sequelize.fn('COALESCE', sequelize.fn('SUM', sequelize.col('start_balance')), 0), 'start_balance'],
+          [sequelize.fn('COALESCE', sequelize.fn('SUM', sequelize.col('end_balance')), 0), 'end_balance'],
+          [sequelize.fn('COALESCE', sequelize.fn('SUM', sequelize.col('amount')), 0), 'bet'],
+          [
+            sequelize.fn(
+              'COALESCE',
+              sequelize.literal('SUM(`result_amount` - `amount`)'),
+              0,
+            ),
+            'win_lose',
+          ],
+        ],
+        raw: true,
+      } as any),
+      getGameLogSyncSummary(scope, normalizedGameId),
+    ]);
 
-          const gamesArr = Array.isArray(resp?.games) ? resp.games : [];
-          for (const g of gamesArr) {
-            const code = String(g?.GameCode ?? '').trim();
-            if (!code) continue;
-            const name = String(g?.GameName ?? '').trim();
-            const type = String(g?.GameType ?? '').trim();
-            gameInfoByCode.set(code, { name, type });
-          }
-
-          const data = resp?.data && typeof resp.data === 'object' ? resp.data : {};
-          for (const key of Object.keys(data)) {
-            const arr = (data as any)[key];
-            if (!Array.isArray(arr)) continue;
-            for (const tx of arr) {
-              const txUsername = String(tx?.Username ?? '').trim();
-              if (!txUsername) continue;
-              if (uname && txUsername !== uname) continue;
-              const ocode = String(tx?.OCode ?? '').trim();
-              const txKey = ocode ? `${entry.gameId}:${ocode}` : '';
-              if (txKey && seen.has(txKey)) continue;
-              const gameCode = String(tx?.GameCode ?? '').trim();
-              const info = gameInfoByCode.get(gameCode);
-              const bet = toFiniteNumber(tx?.Amount);
-              const resultAmount = toFiniteNumber(tx?.Result);
-              rows.push({
-                player: txUsername,
-                start_time: toDisplayDateTimeFromIso(tx?.Time),
-                end_time: toDisplayDateTimeFromIso(tx?.Time),
-                game_id: entry.gameId,
-                ocode: ocode || null,
-                game_provider: entry.providerLabel,
-                game_name: info?.name || null,
-                game_category: info?.type || null,
-                start_balance: toFiniteNumber(tx?.StartBalance),
-                end_balance: toFiniteNumber(tx?.EndBalance),
-                bet,
-                win_lose: resultAmount - bet,
-              });
-              if (txKey) seen.add(txKey);
-              if (rows.length >= maxRows) {
-                hasMore = true;
-                break;
-              }
-            }
-            if (rows.length >= maxRows) break;
-          }
-          if (rows.length >= maxRows) break;
-
-          const nextRaw = resp?.nextId;
-          nextId = nextRaw ? String(nextRaw) : '';
-          pages += 1;
-          if (!nextId) break;
-        }
-
-        if (!nextId && windowEnd.getTime() >= Date.now() - 5 * 60 * 1000) {
-          apiCalls += 1;
-          if (apiCalls > maxApiCalls) {
-            hasMore = true;
-          } else {
-            const resp = await (entry.service as any).getTransactionsByMinute(startStr, endStr, { nextId: lastRequestNextId });
-            updateVendorSummary(entry.providerLabel, resp);
-            if (!resp?.success) {
-              await logAudit(
-                req.user?.id ?? null,
-                'GAME_LOG_QUERY_RESULT',
-                null,
-                {
-                  username: uname || null,
-                  rows: 0,
-                  hasMore: true,
-                  apiCalls,
-                  vendors: Array.from(vendorSummary.entries()).map(([provider, v]) => ({ provider, ...v })),
-                  error: resp?.error || resp?.message || 'Failed to get vendor transactions',
-                },
-                getClientIp(req),
-                { tenant_id: (scope as any)?.tenant_id ?? null, sub_brand_id: (scope as any)?.sub_brand_id ?? null },
-              );
-              sendError(res, 'Code9000', 500, { detail: resp?.error || resp?.message || 'Failed to get vendor transactions' });
-              return;
-            }
-
-            const gamesArr = Array.isArray(resp?.games) ? resp.games : [];
-            for (const g of gamesArr) {
-              const code = String(g?.GameCode ?? '').trim();
-              if (!code) continue;
-              const name = String(g?.GameName ?? '').trim();
-              const type = String(g?.GameType ?? '').trim();
-              gameInfoByCode.set(code, { name, type });
-            }
-
-            const data = resp?.data && typeof resp.data === 'object' ? resp.data : {};
-            for (const key of Object.keys(data)) {
-              const arr = (data as any)[key];
-              if (!Array.isArray(arr)) continue;
-              for (const tx of arr) {
-                const txUsername = String(tx?.Username ?? '').trim();
-                if (!txUsername) continue;
-                if (uname && txUsername !== uname) continue;
-                const ocode = String(tx?.OCode ?? '').trim();
-                const txKey = ocode ? `${entry.gameId}:${ocode}` : '';
-                if (txKey && seen.has(txKey)) continue;
-                const gameCode = String(tx?.GameCode ?? '').trim();
-                const info = gameInfoByCode.get(gameCode);
-                const bet = toFiniteNumber(tx?.Amount);
-                const resultAmount = toFiniteNumber(tx?.Result);
-                rows.push({
-                  player: txUsername,
-                  start_time: toDisplayDateTimeFromIso(tx?.Time),
-                  end_time: toDisplayDateTimeFromIso(tx?.Time),
-                  game_id: entry.gameId,
-                  ocode: ocode || null,
-                  game_provider: entry.providerLabel,
-                  game_name: info?.name || null,
-                  game_category: info?.type || null,
-                  start_balance: toFiniteNumber(tx?.StartBalance),
-                  end_balance: toFiniteNumber(tx?.EndBalance),
-                  bet,
-                  win_lose: resultAmount - bet,
-                });
-                if (txKey) seen.add(txKey);
-                if (rows.length >= maxRows) {
-                  hasMore = true;
-                  break;
-                }
-              }
-              if (rows.length >= maxRows) break;
-            }
-
-            const retryNextRaw = resp?.nextId;
-            const retryNext = retryNextRaw ? String(retryNextRaw) : '';
-            if (retryNext) hasMore = true;
-          }
-        }
-        if (nextId) hasMore = true;
-        if (rows.length >= maxRows || apiCalls > maxApiCalls) break;
-
-        windowStart = windowEnd;
-      }
-      if (rows.length >= maxRows || apiCalls > maxApiCalls) break;
-    }
-
-    const filteredRows = uname ? rows : await filterRowsByScopePlayers(scope, rows);
-    if (!uname && filteredRows.length < rows.length) {
-      hasMore = hasMore || rows.length > filteredRows.length;
-    }
-
-    filteredRows.sort((a, b) => String(b?.start_time ?? '').localeCompare(String(a?.start_time ?? '')));
+    const totalItems = Number(result.count ?? 0) || 0;
+    const rows = (result.rows as any[]).map((row) => ({
+      id: String(row.id),
+      player: String(row.player ?? ''),
+      game_id: row.game_id != null ? Number(row.game_id) : null,
+      ocode: row.vendor_transaction_id ?? null,
+      round_id: row.round_id ?? null,
+      game_code: row.game_code ?? null,
+      game_provider: row.game_provider ?? null,
+      game_name: row.game_name ?? null,
+      game_category: row.game_category ?? null,
+      start_time: toDisplayDateTimeFromStoredTz8(row.occurred_at),
+      end_time: toDisplayDateTimeFromStoredTz8(row.occurred_at),
+      start_balance: toFiniteNumber(row.start_balance),
+      end_balance: toFiniteNumber(row.end_balance),
+      bet: toFiniteNumber(row.amount),
+      win_lose: toFiniteNumber(row.result_amount) - toFiniteNumber(row.amount),
+    }));
+    const totalsRaw = (totalsRow as any) || {};
+    const sync = manualSyncFailed
+      ? { ...syncSummary, status: 'stale', errorCode: syncSummary.errorCode || 'vendor_sync_failed' }
+      : syncSummary;
 
     await logAudit(
       req.user?.id ?? null,
       'GAME_LOG_QUERY_RESULT',
       null,
       {
+        source: 'database',
         username: uname || null,
-        rows: filteredRows.length,
-        hasMore,
-        apiCalls,
-        vendors: Array.from(vendorSummary.entries()).map(([provider, v]) => ({ provider, ...v })),
+        rows: rows.length,
+        totalItems,
+        page: pageNumber,
+        pageSize: pageSizeNumber,
+        syncStatus: sync.status,
+        dataThrough: sync.dataThrough,
       },
       getClientIp(req),
       { tenant_id: (scope as any)?.tenant_id ?? null, sub_brand_id: (scope as any)?.sub_brand_id ?? null },
     );
 
-    const payload = {
+    res.setHeader('Cache-Control', 'private, no-store');
+    sendSuccess(res, 'Code1', {
       username: uname || null,
-      rows: filteredRows,
-      hasMore,
-    };
-    setCache(gameLogCacheKey, payload, 3);
-    res.setHeader('Cache-Control', 'private, max-age=3');
-    sendSuccess(res, 'Code1', payload);
+      rows,
+      page: pageNumber,
+      pageSize: pageSizeNumber,
+      totalItems,
+      hasMore: pageNumber * pageSizeNumber < totalItems,
+      totals: {
+        start_balance: toFiniteNumber(totalsRaw.start_balance),
+        end_balance: toFiniteNumber(totalsRaw.end_balance),
+        bet: toFiniteNumber(totalsRaw.bet),
+        win_lose: toFiniteNumber(totalsRaw.win_lose),
+      },
+      sync,
+    });
   } catch (err: any) {
     sendError(res, 'Code9000', 500, { detail: err?.original?.sqlMessage ?? err?.message ?? 'Failed to get report' });
   }
@@ -1238,7 +1029,7 @@ export const getPlayerGameLogHistoryUrl = async (req: AuthRequest, res: Response
     const normalizedGameId = gid && Number.isFinite(gid) && gid > 0 ? gid : null;
     const svc = await resolveVendorServiceForScope(scope, normalizedGameId, 'transactions');
     if (!svc || typeof (svc as any).getHistoryUrl !== 'function') {
-      sendError(res, 'Code9004', 400, { detail: 'player_game_log_vendor_not_supported' });
+      sendError(res, 'Code9004', 400, { detail: 'Game Log Is Expired' });
       return;
     }
 

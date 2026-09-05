@@ -135,11 +135,11 @@ async function initDb() {
     let defaultTenant: any = null;
     let defaultSubBrand: any = null;
 
-    if (false) {
-      // Initialize default tenant
-      const defaultTenantPrefix = (process.env.INIT_TENANT_PREFIX || '').trim().toUpperCase();
-      const defaultTenantName = (process.env.INIT_TENANT_NAME || '').trim();
+    // Initialize default tenant
+    const defaultTenantPrefix = (process.env.TENANT || process.env.INIT_TENANT_PREFIX || '').trim().toUpperCase();
+    const defaultTenantName = (process.env.TENANT || process.env.INIT_TENANT_NAME || '').trim();
 
+    if (defaultTenantPrefix && defaultTenantName) {
       const [tenant] = await Tenant.findOrCreate({
         where: { prefix: defaultTenantPrefix },
         defaults: {
@@ -152,20 +152,22 @@ async function initDb() {
       console.log(`✅ Default tenant ready: ${defaultTenant.name} (${defaultTenant.prefix})`);
 
       // Initialize default sub-brand
-      const defaultSubBrandCode = (process.env.INIT_SUB_BRAND_CODE || '').trim().toUpperCase();
-      const defaultSubBrandName = (process.env.INIT_SUB_BRAND_NAME || '').trim();
+      const defaultSubBrandCode = (process.env.SUB_BRAND || process.env.INIT_SUB_BRAND_CODE || '').trim().toUpperCase();
+      const defaultSubBrandName = (process.env.SUB_BRAND || process.env.INIT_SUB_BRAND_NAME || '').trim();
 
-      const [subBrand] = await SubBrand.findOrCreate({
-        where: { code: defaultSubBrandCode },
-        defaults: {
-          tenant_id: defaultTenant.id,
-          code: defaultSubBrandCode,
-          name: defaultSubBrandName,
-          status: 'active',
-        },
-      });
-      defaultSubBrand = subBrand;
-      console.log(`✅ Default sub-brand ready: ${defaultSubBrand.name} (${defaultSubBrand.code})\n`);
+      if (defaultSubBrandCode && defaultSubBrandName) {
+        const [subBrand] = await SubBrand.findOrCreate({
+          where: { code: defaultSubBrandCode },
+          defaults: {
+            tenant_id: defaultTenant.id,
+            code: defaultSubBrandCode,
+            name: defaultSubBrandName,
+            status: 'active',
+          },
+        });
+        defaultSubBrand = subBrand;
+        console.log(`✅ Default sub-brand ready: ${defaultSubBrand.name} (${defaultSubBrand.code})\n`);
+      }
     }
 
     // Seed Permissions
@@ -178,10 +180,9 @@ async function initDb() {
     }
     console.log(`✅ ${PERMISSIONS.length} permissions ready.\n`);
 
-    if (false) {
-      // Seed Roles
-      console.log('⏳ Seeding roles...');
-      const allTenants = await Tenant.findAll({ order: [['id', 'ASC']] });
+    // Seed Roles
+    console.log('⏳ Seeding roles...');
+    const allTenants = await Tenant.findAll({ order: [['id', 'ASC']] });
 
       for (const r of GLOBAL_ROLE_SPECS) {
         const [role] = await Role.findOrCreate({
@@ -280,7 +281,6 @@ async function initDb() {
       }
 
       console.log(`✅ Roles ready.\n`);
-    }
 
     // Create Admin User
     console.log('⏳ Creating admin user...');
@@ -299,6 +299,7 @@ async function initDb() {
 
     if (!defaultTenant || !defaultSubBrand) {
       console.log(`ℹ️  Skip admin create: missing tenant/sub-brand.\n`);
+      console.log(`ℹ️  Please set TENANT and SUB_BRAND in your .env file and run db:install again.\n`);
       process.exit(0);
       return;
     }
@@ -338,7 +339,16 @@ async function initDb() {
       console.log('   This password will NOT be shown again.');
       console.log('========================================\n');
     } else {
-      console.log(`ℹ️  Admin user '${adminUsername}' already exists.\n`);
+      console.log(`ℹ️  Admin user '${adminUsername}' already exists. Updating roles...`);
+      // Ensure Super Admin role is assigned even if user already exists
+      const superAdminRole = await Role.findOne({ where: { tenant_id: null, name: 'Super Admin' } as any });
+      if (superAdminRole) {
+        // @ts-ignore
+        await admin.setRoles([superAdminRole]);
+        console.log(`✅ Super Admin role assigned to existing user.\n`);
+      } else {
+        console.log(`⚠️  Super Admin role not found. Please check role seeding.\n`);
+      }
     }
 
     if (false) {

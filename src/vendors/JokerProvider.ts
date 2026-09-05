@@ -184,7 +184,7 @@ export class JokerProvider {
   /**
    * Make HTTP request to Joker API
    */
-  private async request(method: string, body: any): Promise<JokerResponse> {
+  private async request(method: string, body: any, timeoutMs?: number): Promise<JokerResponse> {
     const startedAt = Date.now();
     const timestamp = Math.floor(Date.now() / 1000);
 
@@ -200,6 +200,8 @@ export class JokerProvider {
     url.searchParams.append('appid', this.config.appId);
     url.searchParams.append('signature', signature);
 
+    const controller = timeoutMs ? new AbortController() : null;
+    const timeout = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
     try {
       const response = await fetch(url.toString(), {
         method: 'POST',
@@ -207,6 +209,7 @@ export class JokerProvider {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(requestBody),
+        signal: controller?.signal,
       });
 
       const durationMs = Date.now() - startedAt;
@@ -287,6 +290,8 @@ export class JokerProvider {
         error: error instanceof Error ? error.message : 'Network error',
         durationMs: Date.now() - startedAt,
       };
+    } finally {
+      if (timeout) clearTimeout(timeout);
     }
   }
 
@@ -459,7 +464,7 @@ export class JokerProvider {
       Delay: 0,
     };
 
-    return this.request('TSM', body);
+    return this.request('TSM', body, 20_000);
   }
 
   /**

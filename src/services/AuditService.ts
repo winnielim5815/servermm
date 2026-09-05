@@ -32,7 +32,36 @@ const MASK_KEYS = new Set([
   'user_agent',
   'userAgent',
   'ip',
+  'vendor_config',
+  'vendorConfig',
+  'use_api',
+  'useApi',
 ]);
+
+const API_CONFIGURATION_KEYS = new Set(['vendor_config', 'vendorConfig', 'use_api', 'useApi']);
+
+const maskApiConfiguration = (data: any): any => {
+  if (Array.isArray(data)) return data.map((item) => maskApiConfiguration(item));
+  if (!data || typeof data !== 'object') return data;
+  const masked: any = { ...data };
+  for (const key of Object.keys(masked)) {
+    if (API_CONFIGURATION_KEYS.has(key)) {
+      masked[key] = '***MASKED***';
+    } else {
+      masked[key] = maskApiConfiguration(masked[key]);
+    }
+  }
+  return masked;
+};
+
+export const maskApiConfigurationInAuditPayload = (value: any): any => {
+  if (typeof value !== 'string') return maskApiConfiguration(value);
+  try {
+    return JSON.stringify(maskApiConfiguration(JSON.parse(value)));
+  } catch {
+    return value;
+  }
+};
 
 const maskSensitive = (data: any): any => {
   if (!data) return data;

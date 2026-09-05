@@ -25,6 +25,7 @@ import { AuditLog, Role, SubBrand, User } from '../models';
 import { decrypt, isEncrypted } from '../utils/encryption';
 import { sendSuccess, sendError } from '../utils/response';
 import { getTenancyScopeOrThrow, withTenancyWhere } from '../tenancy/scope';
+import { maskApiConfigurationInAuditPayload } from '../services/AuditService';
 
 const router = Router();
 
@@ -98,6 +99,7 @@ router.get(
 		const canViewAll = permissions.includes('view:audit_logs');
 		const canViewSensitive = permissions.includes('view:sensitive_logs');
 		const canViewUsers = permissions.includes('action:user_view');
+		const isSuperAdmin = Boolean(user?.is_super_admin);
 
 		if (!canViewAll && user) {
 			where.userId = user.id;
@@ -127,8 +129,12 @@ router.get(
 			id: log.id,
 			userId: log.userId ?? null,
 			action: log.action,
-			original_data: canViewSensitive ? log.original_data : null,
-			new_data: canViewSensitive ? log.new_data : null,
+			original_data: canViewSensitive
+				? (isSuperAdmin ? log.original_data : maskApiConfigurationInAuditPayload(log.original_data))
+				: null,
+			new_data: canViewSensitive
+				? (isSuperAdmin ? log.new_data : maskApiConfigurationInAuditPayload(log.new_data))
+				: null,
 			ip_address: canViewSensitive ? (log.ip_address ?? null) : null,
 			created_at: log.created_at,
 			User: log.User

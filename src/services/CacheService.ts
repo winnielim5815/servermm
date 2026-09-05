@@ -15,6 +15,12 @@ export const invalidateCache = (key: string) => {
   cache.del(key);
 };
 
+export const invalidateCacheByPrefix = (prefixes: string | string[]) => {
+  const normalized = Array.isArray(prefixes) ? prefixes : [prefixes];
+  const keys = cache.keys().filter((key) => normalized.some((prefix) => key.startsWith(prefix)));
+  if (keys.length > 0) cache.del(keys);
+};
+
 export const invalidateUserPermissionsCache = (userId: number | string) => {
   const keys = cache.keys();
   const prefixV2 = `user_permissions:v2:${userId}:`;

@@ -1,5 +1,5 @@
 import { Response } from 'express';
-import archiver from 'archiver';
+import { ZipArchive } from 'archiver';
 import { LandingPage } from '../models';
 import { AuthRequest } from '../middleware/auth';
 import { sendError } from '../utils/response';
@@ -618,7 +618,7 @@ export const downloadLandingDistZip = async (req: AuthRequest, res: Response): P
   res.setHeader('Content-Type', 'application/zip');
   res.setHeader('Content-Disposition', `attachment; filename="${zipName}"`);
 
-  const archive = archiver('zip', { zlib: { level: 9 } });
+  const archive = new ZipArchive({ zlib: { level: 9 } });
   archive.on('error', () => {
     try {
       res.status(500).end();

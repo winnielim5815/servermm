@@ -1,6 +1,6 @@
 {
   "name": "backend",
-  "version": "1.0.12",
+  "version": "1.0.14",
   "description": "",
   "main": "index.js",
   "scripts": {
@@ -19,16 +19,15 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "@dotenvx/dotenvx": "^1.54.1",
-    "archiver": "^7.0.1",
-    "bcryptjs": "^3.0.3",
+    "@dotenvx/dotenvx": "2.23.0",
+    "archiver": "8.0.0",
+    "bcryptjs": "3.0.3",
     "compression": "^1.7.5",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.6",
-    "dotenv": "^17.2.4",
+    "dotenv": "17.4.2",
     "express": "^5.2.1",
     "express-rate-limit": "^8.2.1",
-    "git": "^0.1.5",
     "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.3",
     "multer": "^2.0.2",
@@ -36,12 +35,12 @@
     "node-cache": "^5.1.2",
     "otplib": "^13.3.0",
     "qrcode": "^1.5.4",
-    "sequelize": "^6.37.8",
+    "sequelize": "6.37.8",
     "speakeasy": "^2.0.0",
     "ua-parser-js": "^2.0.5"
   },
   "devDependencies": {
-    "@types/archiver": "^7.0.0",
+    "@types/archiver": "8.0.0",
     "@types/bcryptjs": "^2.4.6",
     "@types/compression": "^1.7.6",
     "@types/cookie-parser": "^1.4.10",
@@ -57,8 +56,16 @@
     "jest": "^30.2.0",
     "nodemon": "^3.1.11",
     "supertest": "^7.2.2",
-    "ts-jest": "^29.4.6",
+    "ts-jest": "29.4.12",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
+  },
+  "overrides": {
+    "sequelize": {
+      "uuid": "11.1.1"
+    }
+  },
+  "allowScripts": {
+    "unrs-resolver@1.11.1": true
   }
 }

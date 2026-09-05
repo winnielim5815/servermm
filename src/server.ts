@@ -11,6 +11,7 @@ import { trackLandingEventGif, trackLandingPageViewGif } from './controllers/Lan
 import { generalRateLimit, authRateLimit, uploadRateLimit, trackingRateLimit } from './middleware/rateLimit';
 import { productionErrorHandler, notFoundHandler, setupGlobalErrorHandlers } from './middleware/errorHandler';
 import { requireAppSignature } from './middleware/appSignature';
+import { ensureGameLogStorage, startGameLogSyncScheduler } from './services/GameLogSyncService';
 
 dotenv.config();
 
@@ -187,8 +188,10 @@ const startServer = async () => {
     setupGlobalErrorHandlers();
     
     await sequelize.authenticate();
-    app.listen(PORT, () => {
+    await ensureGameLogStorage();
+    app.listen(PORT, '127.0.0.1', () => {
       console.log(`🚀 Server running...`);
+      startGameLogSyncScheduler();
     });
   } catch (error) {
     console.error('❌ Failed to start server:', error);
