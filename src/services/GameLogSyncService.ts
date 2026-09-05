@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import { Op } from 'sequelize';
+import sequelize from '../config/database';
 import { Game, GameLog, GameLogSyncState, Player, Product } from '../models';
 import { VendorFactory } from './vendor/VendorFactory';
 import { normalizeVendorGameLogPage } from './gameLogNormalize';
@@ -69,11 +70,30 @@ const safeErrorMessage = (error: any) => {
   return (raw || 'Vendor game log sync failed').slice(0, 1000);
 };
 
+const ensureTable = async (tableName: string, createTable: () => Promise<unknown>) => {
+  try {
+    await sequelize.getQueryInterface().describeTable(tableName);
+    return;
+  } catch (error: any) {
+    const code = error?.original?.code ?? error?.parent?.code ?? error?.code;
+    if (code !== 'ER_NO_SUCH_TABLE') throw error;
+  }
+
+  try {
+    await createTable();
+  } catch (error: any) {
+    // Another application instance may create the table or its indexes between
+    // describeTable and sync.
+    const code = error?.original?.code ?? error?.parent?.code ?? error?.code;
+    if (code !== 'ER_TABLE_EXISTS_ERROR' && code !== 'ER_DUP_KEYNAME') throw error;
+  }
+};
+
 export const ensureGameLogStorage = async () => {
   if (!storageReady) {
     storageReady = (async () => {
-      await GameLog.sync();
-      await GameLogSyncState.sync();
+      await ensureTable(GameLog.getTableName() as string, () => GameLog.sync());
+      await ensureTable(GameLogSyncState.getTableName() as string, () => GameLogSyncState.sync());
     })().catch((error) => {
       storageReady = null;
       throw error;
