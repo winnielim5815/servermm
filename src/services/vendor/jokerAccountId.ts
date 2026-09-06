@@ -32,6 +32,21 @@ export const getJokerUsernameWithoutAppId = (providerUsername: unknown): string 
   return parts.length > 0 ? parts[parts.length - 1] : normalized;
 };
 
+export const normalizeJokerAppId = (appId: unknown): string => {
+  const normalized = typeof appId === 'string' ? appId.trim() : '';
+  if (!normalized.includes('.')) return normalized;
+
+  const parts = normalized.split('.').filter(Boolean);
+  const deduplicated: string[] = [];
+  for (const part of parts) {
+    const previous = deduplicated[deduplicated.length - 1];
+    if (!previous || previous.toLowerCase() !== part.toLowerCase()) {
+      deduplicated.push(part);
+    }
+  }
+  return deduplicated.join('.');
+};
+
 export const getJokerAppIdFromVendorConfig = (vendorConfig: unknown): string => {
   let normalizedConfig = vendorConfig;
   if (typeof normalizedConfig === 'string') {
@@ -45,11 +60,11 @@ export const getJokerAppIdFromVendorConfig = (vendorConfig: unknown): string => 
   }
 
   if (!normalizedConfig || typeof normalizedConfig !== 'object' || Array.isArray(normalizedConfig)) return '';
-  return String((normalizedConfig as Record<string, unknown>).appId || '').trim();
+  return normalizeJokerAppId((normalizedConfig as Record<string, unknown>).appId);
 };
 
 export const qualifyJokerAccountId = (providerUsername: unknown, appId: unknown): string => {
-  const normalizedAppId = typeof appId === 'string' ? appId.trim() : '';
+  const normalizedAppId = normalizeJokerAppId(appId);
   const username = getJokerUsernameWithoutAppId(providerUsername);
   if (!normalizedAppId || !username) throw new Error('JOKER_QUALIFIED_ACCOUNT_ID_REQUIRED');
   return `${normalizedAppId}.${username}`;

@@ -15,6 +15,7 @@ import {
   normalizeApiConfiguration,
   withApiConfigurationForResponse,
 } from '../services/gameApiConfigurationPolicy';
+import { normalizeJokerAppId } from '../services/vendor/jokerAccountId';
 
 const isValidUrl = (url: string): boolean => {
   if (!url) return true; // Allow empty/null URLs
@@ -148,7 +149,7 @@ const validateAndBuildVendorConfig = (
     }
 
     if (typeof value !== 'string') return { config: {}, error: 'G206' };
-    const s = value.trim();
+    const s = def.key === 'appId' ? normalizeJokerAppId(value) : value.trim();
     if (!s) return { config: {}, error: 'G204' };
 
     if (def.type === 'url' && s && !isValidUrl(s)) return { config: {}, error: 'G207' };

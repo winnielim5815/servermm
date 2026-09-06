@@ -876,7 +876,9 @@ export const getPlayerList = async (req: AuthRequest, res: Response) => {
           const accountId = typeof ga.accountId === 'string' ? ga.accountId.trim() : '';
           const displayAccountId = getVendorDisplayAccountId(providerCode, accountId, appId);
           if (!displayAccountId) return ga;
-          return { ...ga, displayAccountId };
+          return isJokerProviderCode(providerCode)
+            ? { ...ga, accountId: displayAccountId, displayAccountId }
+            : { ...ga, displayAccountId };
         });
 
         (metadata as any).gameAccounts = nextGameAccountsWithDisplay;
@@ -1299,7 +1301,9 @@ export const searchPlayers = async (req: AuthRequest, res: Response) => {
         const accountId = typeof ga?.accountId === 'string' ? ga.accountId.trim() : '';
         const displayAccountId = getVendorDisplayAccountId(providerCode, accountId, appId);
         if (!displayAccountId) return ga;
-        return { ...ga, displayAccountId };
+        return isJokerProviderCode(providerCode)
+          ? { ...ga, accountId: displayAccountId, displayAccountId }
+          : { ...ga, displayAccountId };
       });
       return {
         id: json.id,
@@ -1382,11 +1386,6 @@ export const retryCreateGameAccount = async (req: AuthRequest, res: Response): P
     const existingAccounts: any[] = Array.isArray(existingMeta.gameAccounts) ? existingMeta.gameAccounts : [];
     const existing = existingAccounts.find((ga) => String(ga?.gameName || '').trim().toLowerCase() === gameName.toLowerCase());
     const existingAttemptedIds: string[] = Array.isArray(existing?.attemptedIds) ? existing.attemptedIds.map((s: any) => String(s)) : [];
-    if (existing && String(existing.accountId || '').trim() && (existing.provisioningStatus || 'CREATED') === 'CREATED') {
-      sendSuccess(res, 'Code1', { gameAccount: existing, idempotent: true });
-      return;
-    }
-
     const game = await Game.findOne({
       where: withTenancyWhere(scope, { name: gameName, status: 'active', use_api: true }),
       include: [{ model: Product, attributes: ['providerCode'], required: false }],
@@ -1397,6 +1396,22 @@ export const retryCreateGameAccount = async (req: AuthRequest, res: Response): P
     }
 
     const providerCode = (game as any)?.Product?.providerCode;
+    if (existing && String(existing.accountId || '').trim() && (existing.provisioningStatus || 'CREATED') === 'CREATED') {
+      const storedAccountId = getVendorAccountIdForStorage(providerCode, game, existing.accountId);
+      const normalizedExisting = isJokerProviderCode(providerCode)
+        ? { ...existing, accountId: storedAccountId, displayAccountId: storedAccountId }
+        : existing;
+      if (storedAccountId !== String(existing.accountId).trim()) {
+        (player as any).metadata = {
+          ...existingMeta,
+          gameAccounts: existingAccounts.map((gameAccount) => gameAccount === existing ? normalizedExisting : gameAccount),
+        };
+        await player.save();
+      }
+      sendSuccess(res, 'Code1', { gameAccount: normalizedExisting, idempotent: true });
+      return;
+    }
+
     const vendor = await VendorFactory.getServiceByProviderCode(providerCode, (game as any).id);
     if (!vendor) {
       sendError(res, 'Code808', 400);
@@ -1565,7 +1580,7 @@ export const recreateGameAccount = async (req: AuthRequest, res: Response): Prom
     const existingMeta: any = (player as any).metadata || {};
     const existingAccounts: any[] = Array.isArray(existingMeta.gameAccounts) ? existingMeta.gameAccounts : [];
     const existing = existingAccounts.find((ga) => String(ga?.gameName || '').trim().toLowerCase() === gameName.toLowerCase());
-    const previousAccountId = typeof existing?.accountId === 'string' ? existing.accountId.trim() : '';
+    let previousAccountId = typeof existing?.accountId === 'string' ? existing.accountId.trim() : '';
     const previousAttemptedIds: string[] = Array.isArray(existing?.attemptedIds) ? existing.attemptedIds.map((s: any) => String(s)) : [];
 
     const game = await Game.findOne({
@@ -1578,6 +1593,9 @@ export const recreateGameAccount = async (req: AuthRequest, res: Response): Prom
     }
 
     const providerCode = (game as any)?.Product?.providerCode;
+    if (previousAccountId && isJokerProviderCode(providerCode)) {
+      previousAccountId = getVendorAccountIdForStorage(providerCode, game, previousAccountId);
+    }
     const vendor = await VendorFactory.getServiceByProviderCode(providerCode, (game as any).id);
     if (!vendor) {
       sendError(res, 'Code808', 400);
@@ -1710,8 +1728,13 @@ export const syncActiveGameAccounts = async (req: AuthRequest, res: Response) =>
       return;
     }
 
-    const existingMeta: any = (player as any).metadata || {};
+    const originalExistingMeta: any = (player as any).metadata || {};
+    const existingMeta: any = await qualifyJokerMetadataAccountsForStorage(originalExistingMeta, scope);
     const existingAccounts: any[] = Array.isArray(existingMeta.gameAccounts) ? existingMeta.gameAccounts : [];
+    if (JSON.stringify(existingMeta) !== JSON.stringify(originalExistingMeta)) {
+      (player as any).metadata = existingMeta;
+      await player.save();
+    }
 
     const normalizeGameName = (s: any) => String(s || '').trim().toLowerCase();
     const existingGameNames = new Set<string>(existingAccounts.map((ga) => normalizeGameName(ga?.gameName)).filter(Boolean));

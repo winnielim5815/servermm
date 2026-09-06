@@ -10,6 +10,7 @@ import {
 import { BaseVendorService } from '../BaseVendorService';
 import Game from '../../../models/Game';
 import { decrypt, isEncrypted } from '../../../utils/encryption';
+import { normalizeJokerAppId } from '../jokerAccountId';
 
 const toNumber = (v: any): number | undefined => {
   if (typeof v === 'number' && Number.isFinite(v)) return v;
@@ -70,8 +71,9 @@ export class JokerVendorService extends BaseVendorService implements VendorServi
     }
 
     const { apiUrl, appId, signatureKey } = normalizedConfig as Record<string, string>;
+    const normalizedAppId = normalizeJokerAppId(appId);
 
-    if (!apiUrl || !appId || !signatureKey) {
+    if (!apiUrl || !normalizedAppId || !signatureKey) {
       throw new Error('Missing required Joker configuration (apiUrl, appId, signatureKey)');
     }
 
@@ -82,7 +84,7 @@ export class JokerVendorService extends BaseVendorService implements VendorServi
 
     const config: JokerConfig = {
       apiUrl,
-      appId,
+      appId: normalizedAppId,
       signatureKey: decryptedSignatureKey,
     };
 
@@ -116,7 +118,7 @@ export class JokerVendorService extends BaseVendorService implements VendorServi
       if (!vendorConfig || typeof vendorConfig !== 'object' || Array.isArray(vendorConfig)) return false;
 
       const { apiUrl, appId, signatureKey } = vendorConfig as Record<string, string>;
-      return !!(apiUrl && appId && signatureKey);
+      return !!(apiUrl && normalizeJokerAppId(appId) && signatureKey);
     } catch {
       return false;
     }

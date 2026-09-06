@@ -4,6 +4,7 @@ import {
   getJokerSubBrandPrefix,
   getJokerUsernameWithoutAppId,
   isJokerAccountId,
+  normalizeJokerAppId,
   qualifyJokerAccountId,
 } from './jokerAccountId';
 
@@ -39,5 +40,12 @@ describe('Joker account ID', () => {
     expect(qualifyJokerAccountId('AB1234567890', 'APPID')).toBe('APPID.AB1234567890');
     expect(qualifyJokerAccountId('OLD.AB1234567890', 'APPID')).toBe('APPID.AB1234567890');
     expect(() => qualifyJokerAccountId('AB1234567890', '')).toThrow('JOKER_QUALIFIED_ACCOUNT_ID_REQUIRED');
+  });
+
+  it('removes repeated app id prefixes from configuration and provider responses', () => {
+    expect(normalizeJokerAppId('FVNM.FVNM')).toBe('FVNM');
+    expect(getJokerAppIdFromVendorConfig({ appId: 'FVNM.FVNM' })).toBe('FVNM');
+    expect(qualifyJokerAccountId('FVNM.FVNM.SP3602436765', 'FVNM')).toBe('FVNM.SP3602436765');
+    expect(qualifyJokerAccountId('FVNM.SP3602436765', 'FVNM.FVNM')).toBe('FVNM.SP3602436765');
   });
 });
