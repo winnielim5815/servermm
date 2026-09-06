@@ -12,6 +12,11 @@ import { AuthRequest } from '../middleware/auth';
 import { encrypt, decrypt, isEncrypted } from '../utils/encryption';
 import speakeasy from 'speakeasy';
 import QRCode from 'qrcode';
+import {
+  normalizeBase32Secret,
+  resolveVerifiedSetupSecret,
+  verifyTotpCode,
+} from '../services/twoFactorPolicy';
 import { setCache, getCache, invalidateCache } from '../services/CacheService';
 import { sendSuccess, sendError, sendWarning } from '../utils/response';
 
@@ -799,15 +804,25 @@ export const setup2FA = async (req: Request, res: Response): Promise<void> => {
         }
         const displayName = user?.full_name || decoded.username || 'User';
 
-        const secret = speakeasy.generateSecret({ length: 20, name: `SparkX (${displayName})` });
-        
-        // Store secret in cache for verification step (10 mins)
-        setCache(`2fa_setup_secret:${decoded.id}`, secret.base32, 600);
+        const cacheKey = `2fa_setup_secret:${decoded.id}`;
+        const cachedSecret = normalizeBase32Secret(getCache(cacheKey));
+        const generatedSecret = cachedSecret
+          ? null
+          : speakeasy.generateSecret({ length: 20, name: `SparkX (${displayName})` });
+        const secretBase32 = cachedSecret || generatedSecret!.base32;
+        const otpauthUrl = generatedSecret?.otpauth_url || speakeasy.otpauthURL({
+          secret: secretBase32,
+          encoding: 'base32',
+          label: `SparkX (${displayName})`,
+        });
 
-        const qrCodeUrl = await QRCode.toDataURL(secret.otpauth_url || '');
+        // Store secret in cache for verification step (10 mins)
+        setCache(cacheKey, secretBase32, 600);
+
+        const qrCodeUrl = await QRCode.toDataURL(otpauthUrl);
 
         sendSuccess(res, 'Code1', {
-            secret: secret.base32,
+            secret: secretBase32,
             qrCode: qrCodeUrl
         });
 
@@ -861,24 +876,27 @@ export const verify2FA = async (req: Request, res: Response): Promise<void> => {
         }
 
         if (decoded.stage === '2fa_setup') {
-             // Verify against cached secret
+             // Prefer the secret shown by this setup response, then fall back for older clients.
              const cachedSecret = getCache(`2fa_setup_secret:${user.id}`);
-             const secretToUse =
-               (typeof cachedSecret === 'string' && cachedSecret.length > 0 && cachedSecret) ||
-               (typeof setupSecret === 'string' && setupSecret.trim().length > 0 ? setupSecret.trim() : null);
-             if (!secretToUse) {
+             const hasSetupSecret = Boolean(normalizeBase32Secret(setupSecret));
+             const hasCachedSecret = Boolean(normalizeBase32Secret(cachedSecret));
+             if (!hasSetupSecret && !hasCachedSecret) {
                  sendError(res, 'Code212', 400);
                  return;
              }
 
-             const verified = speakeasy.totp.verify({
-                 secret: secretToUse as string,
-                 encoding: 'base32',
-                 token: code
+             const secretToUse = resolveVerifiedSetupSecret({
+                 setupSecret,
+                 cachedSecret,
+                 token: code,
              });
 
-             if (!verified) {
-                await logAudit(user.id, 'TWOFA_VERIFY_FAILED', null, null, clientIp || undefined);
+             if (!secretToUse) {
+                await logAudit(user.id, 'TWOFA_VERIFY_FAILED', {
+                  stage: 'setup',
+                  setupSecretProvided: hasSetupSecret,
+                  cachedSecretPresent: hasCachedSecret,
+                }, null, clientIp || undefined);
                 sendError(res, 'Code213', 401);
                 return;
              }
@@ -900,16 +918,12 @@ export const verify2FA = async (req: Request, res: Response): Promise<void> => {
              }
 
              const secret = decrypt(user.two_factor_secret);
-             const verified = speakeasy.totp.verify({
-                 secret,
-                 encoding: 'base32',
-                 token: code
-             });
+             const verified = verifyTotpCode(secret, code);
 
              if (!verified) {
-                 await logAudit(user.id, 'TWOFA_VERIFY_FAILED', null, null, clientIp || undefined);
-                 sendError(res, 'Code213', 401);
-                 return;
+                await logAudit(user.id, 'TWOFA_VERIFY_FAILED', { stage: 'verify' }, null, clientIp || undefined);
+                sendError(res, 'Code213', 401);
+                return;
              }
         } else {
              sendError(res, 'Code215', 400);
