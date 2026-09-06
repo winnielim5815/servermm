@@ -14,6 +14,8 @@ import { getCache, setCache } from '../services/CacheService';
 import {
   generateJokerAccountId,
   getJokerDisplayAccountId,
+  getJokerSubBrandPrefix,
+  isJokerAccountId,
 } from '../services/vendor/jokerAccountId';
 
 const resolveOperatorName = (op: any): string | null => {
@@ -111,7 +113,9 @@ const generateInitialVendorAccountId = (
   defaultAccountId: string,
   subBrandCode: unknown,
 ): string => isJokerProviderCode(providerCode)
-  ? generateJokerAccountId(subBrandCode)
+  ? (isJokerAccountId(defaultAccountId, subBrandCode)
+    ? defaultAccountId.trim().toUpperCase()
+    : generateJokerAccountId(subBrandCode))
   : defaultAccountId;
 
 const generateNextVendorAccountId = (
@@ -1272,16 +1276,9 @@ export const searchPlayers = async (req: AuthRequest, res: Response) => {
 const generateNextPlayerId = async (scope: { tenant_id: number; sub_brand_id: number }): Promise<string> => {
   const sb = await SubBrand.findOne({ where: { id: scope.sub_brand_id, tenant_id: scope.tenant_id } as any } as any);
   const rawPrefix = typeof (sb as any)?.code === 'string' ? String((sb as any).code).trim() : '';
-  const cleanedPrefix = rawPrefix.toUpperCase().replace(/[^A-Z0-9]/g, '');
-  const prefix = cleanedPrefix.length > 0 ? cleanedPrefix : `SB${scope.sub_brand_id}`;
-
-  const random6 = () => {
-    const v = randomBytes(4).readUInt32BE(0) % 999999;
-    return String(v + 1).padStart(6, '0');
-  };
 
   for (let attempt = 0; attempt < 50; attempt++) {
-    const candidate = `${prefix}${random6()}`;
+    const candidate = generateJokerAccountId(rawPrefix);
     const exists = await Player.findOne({
       where: withTenancyWhere(scope, { player_game_id: candidate }),
       attributes: ['id'],
@@ -1552,7 +1549,9 @@ export const recreateGameAccount = async (req: AuthRequest, res: Response): Prom
     for (const id of previousAttemptedIds) candidates.add(String(id || '').trim());
     if (previousAccountId) candidates.add(previousAccountId);
 
-    let finalAccountId = generateInitialVendorAccountId(providerCode, baseAccountId, jokerSubBrandCode);
+    let finalAccountId = isJokerProviderCode(providerCode)
+      ? generateNextVendorAccountId(providerCode, baseAccountId, jokerSubBrandCode)
+      : generateInitialVendorAccountId(providerCode, baseAccountId, jokerSubBrandCode);
     let result: any = null;
     let created = false;
 
@@ -1948,12 +1947,11 @@ export const createPlayer = async (req: AuthRequest, res: Response): Promise<voi
     const { player_game_id, game_id, tags, metadata } = req.body;
     const userPermissions = req.user?.permissions || [];
     
-    // Generate/validate player ID by sub brand prefix: <SubBrand.code><6 digits>
+    // Generate/validate player ID: <first two Subbrand characters><10 digits>
     const sb = await SubBrand.findOne({ where: { id: scope.sub_brand_id, tenant_id: scope.tenant_id } as any } as any);
     const rawPrefix = typeof (sb as any)?.code === 'string' ? String((sb as any).code).trim() : '';
-    const cleanedPrefix = rawPrefix.toUpperCase().replace(/[^A-Z0-9]/g, '');
-    const prefix = cleanedPrefix.length > 0 ? cleanedPrefix : `SB${scope.sub_brand_id}`;
-    const pattern = new RegExp(`^${prefix}[0-9]{6}$`);
+    const prefix = getJokerSubBrandPrefix(rawPrefix);
+    const pattern = new RegExp(`^${prefix}[0-9]{10}$`);
 
     let finalPlayerId: string;
     if (typeof player_game_id === 'string' && player_game_id.trim().length > 0 && pattern.test(player_game_id.trim().toUpperCase())) {
@@ -2139,7 +2137,8 @@ export const createPlayer = async (req: AuthRequest, res: Response): Promise<voi
         const attemptedIds: string[] = [];
         const candidates = new Set<string>();
         const requestedAccountId = String(accountId || baseAccountId).trim() || baseAccountId;
-        let finalAccountId = generateInitialVendorAccountId(providerCode, requestedAccountId, rawPrefix);
+        const initialAccountId = isJokerProviderCode(providerCode) ? baseAccountId : requestedAccountId;
+        let finalAccountId = generateInitialVendorAccountId(providerCode, initialAccountId, rawPrefix);
         let result: any = null;
         let created = false;
         for (let attempt = 0; attempt < 10; attempt++) {

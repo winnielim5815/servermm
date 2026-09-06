@@ -2,6 +2,7 @@ import {
   generateJokerAccountId,
   getJokerDisplayAccountId,
   getJokerSubBrandPrefix,
+  isJokerAccountId,
 } from './jokerAccountId';
 
 describe('Joker account ID', () => {
@@ -17,6 +18,12 @@ describe('Joker account ID', () => {
     expect(getJokerSubBrandPrefix('')).toBe('SB');
     expect(getJokerSubBrandPrefix('x')).toBe('SB');
     expect(generateJokerAccountId(null)).toMatch(/^SB\d{10}$/);
+  });
+
+  it('recognizes only the requested Subbrand prefix plus ten digits', () => {
+    expect(isJokerAccountId('AB1234567890', 'ABCDE')).toBe(true);
+    expect(isJokerAccountId('abcde123456', 'ABCDE')).toBe(false);
+    expect(isJokerAccountId('AC1234567890', 'ABCDE')).toBe(false);
   });
 
   it('hides the provider app id from the displayed Joker account ID', () => {

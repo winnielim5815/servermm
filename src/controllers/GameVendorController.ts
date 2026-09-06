@@ -1,8 +1,13 @@
 import { Response } from 'express';
 import { logAudit, getClientIp } from '../services/AuditService';
 import { AuthRequest } from '../middleware/auth';
-import { Game, Product } from '../models';
+import { Game, Product, SubBrand } from '../models';
 import { VendorFactory } from '../services/vendor/VendorFactory';
+import {
+  generateJokerAccountId,
+  getJokerDisplayAccountId,
+  isJokerAccountId,
+} from '../services/vendor/jokerAccountId';
 import { sendSuccess, sendError } from '../utils/response';
 import { getTenancyScopeOrThrow, withTenancyWhere } from '../tenancy/scope';
 
@@ -83,7 +88,26 @@ export const createPlayer = async (req: AuthRequest, res: Response): Promise<voi
     const vendor = await getVendor(req, Number(gameId), res);
     if (!vendor) return;
 
-    const result = await vendor.createPlayer(username);
+    const scope = getTenancyScopeOrThrow(req);
+    const game = await Game.findOne({
+      where: withTenancyWhere(scope, { id: Number(gameId) }),
+      include: [{ model: Product, attributes: ['providerCode'], required: false }],
+    } as any);
+    const providerCode = (game as any)?.Product?.providerCode;
+    const isJoker = VendorFactory.getVendorTypeByCode(Number(providerCode)) === 'joker';
+    let finalUsername = username.trim();
+    if (isJoker) {
+      const subBrand = await SubBrand.findOne({
+        where: { id: scope.sub_brand_id, tenant_id: scope.tenant_id } as any,
+        attributes: ['code'],
+      } as any);
+      const subBrandCode = (subBrand as any)?.code;
+      finalUsername = isJokerAccountId(finalUsername, subBrandCode)
+        ? finalUsername.toUpperCase()
+        : generateJokerAccountId(subBrandCode);
+    }
+
+    const result = await vendor.createPlayer(finalUsername);
     const vendorRaw = (result as any)?.raw;
     if (!result.success) {
       sendError(res, 'Code9000', 400, { detail: result.error || result.message || 'Failed to create player', vendorRaw: includeVendorRaw ? vendorRaw : undefined });
@@ -95,11 +119,21 @@ export const createPlayer = async (req: AuthRequest, res: Response): Promise<voi
       req.user?.id || null,
       `vendor:create_player`,
       null,
-      { gameId: String(gameId), player: username, status: result.status },
+      { gameId: String(gameId), player: finalUsername, status: result.status },
       getClientIp(req) || null
     );
 
-    sendSuccess(res, 'Code1', { success: true, message: result.message || 'OK', status: result.status, vendorRaw: includeVendorRaw ? vendorRaw : undefined });
+    const providerUsername =
+      vendorRaw?.data?.Data?.Username ||
+      vendorRaw?.data?.Username ||
+      finalUsername;
+    sendSuccess(res, 'Code1', {
+      success: true,
+      message: result.message || 'OK',
+      status: result.status,
+      username: isJoker ? getJokerDisplayAccountId(providerUsername) : providerUsername,
+      vendorRaw: includeVendorRaw ? vendorRaw : undefined,
+    });
   } catch (error: any) {
     sendError(res, 'Code9000', 500, { detail: error.message || 'Failed to create player' });
   }

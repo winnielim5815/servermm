@@ -18,6 +18,12 @@ export const generateJokerAccountId = (subBrandCode: unknown): string => {
   return `${getJokerSubBrandPrefix(subBrandCode)}${digits}`;
 };
 
+export const isJokerAccountId = (value: unknown, subBrandCode: unknown): boolean => {
+  const normalized = typeof value === 'string' ? value.trim().toUpperCase() : '';
+  const prefix = getJokerSubBrandPrefix(subBrandCode);
+  return new RegExp(`^${prefix}\\d{${JOKER_ACCOUNT_ID_DIGITS}}$`).test(normalized);
+};
+
 export const getJokerDisplayAccountId = (providerUsername: unknown): string => {
   const normalized = typeof providerUsername === 'string' ? providerUsername.trim() : '';
   if (!normalized.includes('.')) return normalized;
