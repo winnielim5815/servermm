@@ -1,8 +1,10 @@
 import {
   generateJokerAccountId,
-  getJokerDisplayAccountId,
+  getJokerAppIdFromVendorConfig,
   getJokerSubBrandPrefix,
+  getJokerUsernameWithoutAppId,
   isJokerAccountId,
+  qualifyJokerAccountId,
 } from './jokerAccountId';
 
 describe('Joker account ID', () => {
@@ -26,8 +28,16 @@ describe('Joker account ID', () => {
     expect(isJokerAccountId('AC1234567890', 'ABCDE')).toBe(false);
   });
 
-  it('hides the provider app id from the displayed Joker account ID', () => {
-    expect(getJokerDisplayAccountId('APPID.AB1234567890')).toBe('AB1234567890');
-    expect(getJokerDisplayAccountId('AB1234567890')).toBe('AB1234567890');
+  it('extracts the unqualified username only for API normalization', () => {
+    expect(getJokerUsernameWithoutAppId('APPID.AB1234567890')).toBe('AB1234567890');
+    expect(getJokerUsernameWithoutAppId('AB1234567890')).toBe('AB1234567890');
+  });
+
+  it('always qualifies the stored account with the configured app id', () => {
+    expect(getJokerAppIdFromVendorConfig({ appId: 'APPID' })).toBe('APPID');
+    expect(getJokerAppIdFromVendorConfig('{"appId":"APPID"}')).toBe('APPID');
+    expect(qualifyJokerAccountId('AB1234567890', 'APPID')).toBe('APPID.AB1234567890');
+    expect(qualifyJokerAccountId('OLD.AB1234567890', 'APPID')).toBe('APPID.AB1234567890');
+    expect(() => qualifyJokerAccountId('AB1234567890', '')).toThrow('JOKER_QUALIFIED_ACCOUNT_ID_REQUIRED');
   });
 });

@@ -5,8 +5,9 @@ import { Game, Product, SubBrand } from '../models';
 import { VendorFactory } from '../services/vendor/VendorFactory';
 import {
   generateJokerAccountId,
-  getJokerDisplayAccountId,
+  getJokerAppIdFromVendorConfig,
   isJokerAccountId,
+  qualifyJokerAccountId,
 } from '../services/vendor/jokerAccountId';
 import { sendSuccess, sendError } from '../utils/response';
 import { getTenancyScopeOrThrow, withTenancyWhere } from '../tenancy/scope';
@@ -123,15 +124,18 @@ export const createPlayer = async (req: AuthRequest, res: Response): Promise<voi
       getClientIp(req) || null
     );
 
-    const providerUsername =
+    const rawProviderUsername =
       vendorRaw?.data?.Data?.Username ||
       vendorRaw?.data?.Username ||
       finalUsername;
+    const providerUsername = isJoker
+      ? qualifyJokerAccountId(rawProviderUsername, getJokerAppIdFromVendorConfig((game as any)?.vendor_config))
+      : rawProviderUsername;
     sendSuccess(res, 'Code1', {
       success: true,
       message: result.message || 'OK',
       status: result.status,
-      username: isJoker ? getJokerDisplayAccountId(providerUsername) : providerUsername,
+      username: providerUsername,
       vendorRaw: includeVendorRaw ? vendorRaw : undefined,
     });
   } catch (error: any) {

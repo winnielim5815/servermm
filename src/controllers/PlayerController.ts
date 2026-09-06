@@ -13,9 +13,10 @@ import { getSettingValue } from '../services/SettingService';
 import { getCache, setCache } from '../services/CacheService';
 import {
   generateJokerAccountId,
-  getJokerDisplayAccountId,
+  getJokerAppIdFromVendorConfig,
   getJokerSubBrandPrefix,
   isJokerAccountId,
+  qualifyJokerAccountId,
 } from '../services/vendor/jokerAccountId';
 
 const resolveOperatorName = (op: any): string | null => {
@@ -132,9 +133,58 @@ const getVendorDisplayAccountId = (
   appId: string,
 ): string | null => {
   if (!accountId) return null;
-  if (isJokerProviderCode(providerCode)) return getJokerDisplayAccountId(accountId);
+  if (isJokerProviderCode(providerCode)) {
+    return appId ? qualifyJokerAccountId(accountId, appId) : accountId;
+  }
   if (!appId) return null;
   return accountId.includes('.') ? accountId : `${appId}.${accountId}`;
+};
+
+const getVendorAccountIdForStorage = (
+  providerCode: unknown,
+  game: any,
+  providerUsername: unknown,
+): string => {
+  const normalized = typeof providerUsername === 'string' ? providerUsername.trim() : '';
+  if (!isJokerProviderCode(providerCode)) return normalized;
+  const appId = getJokerAppIdFromVendorConfig(game?.vendor_config);
+  return qualifyJokerAccountId(normalized, appId);
+};
+
+const qualifyJokerMetadataAccountsForStorage = async (
+  metadata: any,
+  scope: { tenant_id: number; sub_brand_id: number },
+): Promise<any> => {
+  const gameAccounts = Array.isArray(metadata?.gameAccounts) ? metadata.gameAccounts : null;
+  if (!gameAccounts) return metadata;
+
+  const games = await Game.findAll({
+    where: withTenancyWhere(scope),
+    include: [{ model: Product, attributes: ['providerCode'], required: false }],
+  } as any);
+  const gameByName = new Map<string, any>();
+  for (const game of games as any[]) {
+    const name = String(game?.name || '').trim().toLowerCase();
+    if (name) gameByName.set(name, game);
+  }
+
+  const normalizedAccounts = gameAccounts.map((gameAccount: any) => {
+    if (!gameAccount || typeof gameAccount !== 'object') return gameAccount;
+    const gameName = String(gameAccount?.gameName || '').trim().toLowerCase();
+    const game = gameByName.get(gameName);
+    const providerCode = game?.Product?.providerCode;
+    const accountId = typeof gameAccount?.accountId === 'string' ? gameAccount.accountId.trim() : '';
+    if (!game || !accountId || !isJokerProviderCode(providerCode)) return gameAccount;
+
+    const storedAccountId = getVendorAccountIdForStorage(providerCode, game, accountId);
+    return {
+      ...gameAccount,
+      accountId: storedAccountId,
+      displayAccountId: storedAccountId,
+    };
+  });
+
+  return { ...metadata, gameAccounts: normalizedAccounts };
 };
 
 const validateMetadata = (metadata: any): string | null => {
@@ -1437,12 +1487,13 @@ export const retryCreateGameAccount = async (req: AuthRequest, res: Response): P
       return;
     }
 
-    const providerUsername =
+    const rawProviderUsername =
       (result as any)?.raw?.data?.Data?.Username ||
       (result as any)?.raw?.data?.Username ||
       finalAccountId;
+    const providerUsername = getVendorAccountIdForStorage(providerCode, game, rawProviderUsername);
     const displayAccountId = isJokerProviderCode(providerCode)
-      ? getJokerDisplayAccountId(providerUsername)
+      ? providerUsername
       : undefined;
     const FIXED_PASSWORD = 'Abcd12345';
     const pwdResult = await vendor.setPlayerPassword(providerUsername, FIXED_PASSWORD);
@@ -1591,12 +1642,13 @@ export const recreateGameAccount = async (req: AuthRequest, res: Response): Prom
       return;
     }
 
-    const providerUsername =
+    const rawProviderUsername =
       (result as any)?.raw?.data?.Data?.Username ||
       (result as any)?.raw?.data?.Username ||
       finalAccountId;
+    const providerUsername = getVendorAccountIdForStorage(providerCode, game, rawProviderUsername);
     const displayAccountId = isJokerProviderCode(providerCode)
-      ? getJokerDisplayAccountId(providerUsername)
+      ? providerUsername
       : undefined;
     const FIXED_PASSWORD = 'Abcd12345';
     const pwdResult = await vendor.setPlayerPassword(providerUsername, FIXED_PASSWORD);
@@ -1802,12 +1854,13 @@ export const syncActiveGameAccounts = async (req: AuthRequest, res: Response) =>
         return;
       }
 
-      const providerUsername =
+      const rawProviderUsername =
         (result as any)?.raw?.data?.Data?.Username ||
         (result as any)?.raw?.data?.Username ||
         finalAccountId;
+      const providerUsername = getVendorAccountIdForStorage(providerCode, game, rawProviderUsername);
       const displayAccountId = isJokerProviderCode(providerCode)
-        ? getJokerDisplayAccountId(providerUsername)
+        ? providerUsername
         : undefined;
       const createdNow =
         (result as any)?.status === 'Created' ||
@@ -2197,12 +2250,13 @@ export const createPlayer = async (req: AuthRequest, res: Response): Promise<voi
         let passwordSet = false;
         let gamePassword: string | undefined;
         let passwordRaw: any = undefined;
-        const providerUsername =
+        const rawProviderUsername =
           (result as any)?.raw?.data?.Data?.Username ||
           (result as any)?.raw?.data?.Username ||
           finalAccountId;
+        const providerUsername = getVendorAccountIdForStorage(providerCode, game, rawProviderUsername);
         const displayAccountId = isJokerProviderCode(providerCode)
-          ? getJokerDisplayAccountId(providerUsername)
+          ? providerUsername
           : undefined;
         if (result?.success) {
           const FIXED_PASSWORD = 'Abcd12345';
@@ -2357,9 +2411,13 @@ export const updatePlayer = async (req: AuthRequest, res: Response): Promise<voi
       incomingMetadata = cloned;
     }
     // Merge metadata to avoid wiping fields (e.g., gameAccounts) when client omits them
-    const effectiveMetadata = incomingMetadata
+    let effectiveMetadata = incomingMetadata
       ? { ...(originalData.metadata || {}), ...(incomingMetadata as any) }
       : undefined;
+
+    if (effectiveMetadata) {
+      effectiveMetadata = await qualifyJokerMetadataAccountsForStorage(effectiveMetadata, scope);
+    }
 
     if (effectiveMetadata) {
       const validationError = validateMetadata(effectiveMetadata);
