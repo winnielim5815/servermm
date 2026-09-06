@@ -11,6 +11,10 @@ import { sendSuccess, sendError } from '../utils/response';
 import { getTenancyScopeOrThrow, withTenancyCreate, withTenancyWhere } from '../tenancy/scope';
 import { getSettingValue } from '../services/SettingService';
 import { getCache, setCache } from '../services/CacheService';
+import {
+  generateJokerAccountId,
+  getJokerDisplayAccountId,
+} from '../services/vendor/jokerAccountId';
 
 const resolveOperatorName = (op: any): string | null => {
   if (!op || typeof op !== 'object') return null;
@@ -95,6 +99,38 @@ const randomAlnumUpper = (length: number): string => {
 const generateConflictAccountId = (base: string): string => {
   const digit = String(randomBytes(1)[0] % 10);
   return `${base}${digit}`;
+};
+
+const isJokerProviderCode = (providerCode: unknown): boolean => {
+  const normalized = Number(providerCode);
+  return Number.isFinite(normalized) && VendorFactory.getVendorTypeByCode(normalized) === 'joker';
+};
+
+const generateInitialVendorAccountId = (
+  providerCode: unknown,
+  defaultAccountId: string,
+  subBrandCode: unknown,
+): string => isJokerProviderCode(providerCode)
+  ? generateJokerAccountId(subBrandCode)
+  : defaultAccountId;
+
+const generateNextVendorAccountId = (
+  providerCode: unknown,
+  defaultAccountId: string,
+  subBrandCode: unknown,
+): string => isJokerProviderCode(providerCode)
+  ? generateJokerAccountId(subBrandCode)
+  : generateConflictAccountId(defaultAccountId);
+
+const getVendorDisplayAccountId = (
+  providerCode: unknown,
+  accountId: string,
+  appId: string,
+): string | null => {
+  if (!accountId) return null;
+  if (isJokerProviderCode(providerCode)) return getJokerDisplayAccountId(accountId);
+  if (!appId) return null;
+  return accountId.includes('.') ? accountId : `${appId}.${accountId}`;
 };
 
 const validateMetadata = (metadata: any): string | null => {
@@ -499,6 +535,7 @@ export const getPlayerList = async (req: AuthRequest, res: Response) => {
     const games = await Game.findAll({
       attributes: ['id', 'name', 'icon', 'vendor_config'],
       where: withTenancyWhere(scope, { status: 'active' }),
+      include: [{ model: Product, attributes: ['providerCode'], required: false }],
     } as any);
 
     const [bankCatalog, referralSetting, tagSetting, allOperators] = includeMeta
@@ -713,9 +750,14 @@ export const getPlayerList = async (req: AuthRequest, res: Response) => {
     }
 
     const gameAppIdByNameLower = new Map<string, string>();
+    const gameProviderCodeByNameLower = new Map<string, number>();
     for (const g of games as any[]) {
       const name = typeof g?.name === 'string' ? g.name.trim() : '';
       if (!name) continue;
+      const providerCode = Number((g as any)?.Product?.providerCode);
+      if (Number.isFinite(providerCode)) {
+        gameProviderCodeByNameLower.set(name.toLowerCase(), providerCode);
+      }
       let cfg: any = (g as any).vendor_config;
       if (typeof cfg === 'string') {
         const s = cfg.trim();
@@ -777,10 +819,10 @@ export const getPlayerList = async (req: AuthRequest, res: Response) => {
           if (!ga || typeof ga !== 'object') return ga;
           const name = typeof ga.gameName === 'string' ? ga.gameName.trim().toLowerCase() : '';
           const appId = name ? (gameAppIdByNameLower.get(name) ?? '') : '';
+          const providerCode = name ? gameProviderCodeByNameLower.get(name) : undefined;
           const accountId = typeof ga.accountId === 'string' ? ga.accountId.trim() : '';
-          if (!appId || !accountId) return ga;
-          const hasDot = accountId.includes('.');
-          const displayAccountId = hasDot ? accountId : `${appId}.${accountId}`;
+          const displayAccountId = getVendorDisplayAccountId(providerCode, accountId, appId);
+          if (!displayAccountId) return ga;
           return { ...ga, displayAccountId };
         });
 
@@ -1152,6 +1194,7 @@ export const searchPlayers = async (req: AuthRequest, res: Response) => {
     const activeGames = await Game.findAll({
       attributes: ['name', 'vendor_config'],
       where: withTenancyWhere(scope, { status: 'active' }),
+      include: [{ model: Product, attributes: ['providerCode'], required: false }],
     } as any);
     const activeGameNames = new Set(
       (activeGames as any[]).map((g) =>
@@ -1160,9 +1203,14 @@ export const searchPlayers = async (req: AuthRequest, res: Response) => {
     );
 
     const gameAppIdByNameLower = new Map<string, string>();
+    const gameProviderCodeByNameLower = new Map<string, number>();
     for (const g of activeGames as any[]) {
       const name = String(g?.name || '').trim().toLowerCase();
       if (!name) continue;
+      const providerCode = Number((g as any)?.Product?.providerCode);
+      if (Number.isFinite(providerCode)) {
+        gameProviderCodeByNameLower.set(name, providerCode);
+      }
       let cfg: any = (g as any).vendor_config;
       if (typeof cfg === 'string') {
         const s = cfg.trim();
@@ -1194,9 +1242,10 @@ export const searchPlayers = async (req: AuthRequest, res: Response) => {
       }).map((ga: any) => {
         const name = String(ga?.gameName || '').trim().toLowerCase();
         const appId = name ? (gameAppIdByNameLower.get(name) ?? '') : '';
+        const providerCode = name ? gameProviderCodeByNameLower.get(name) : undefined;
         const accountId = typeof ga?.accountId === 'string' ? ga.accountId.trim() : '';
-        if (!appId || !accountId) return ga;
-        const displayAccountId = accountId.includes('.') ? accountId : `${appId}.${accountId}`;
+        const displayAccountId = getVendorDisplayAccountId(providerCode, accountId, appId);
+        if (!displayAccountId) return ga;
         return { ...ga, displayAccountId };
       });
       return {
@@ -1294,26 +1343,33 @@ export const retryCreateGameAccount = async (req: AuthRequest, res: Response): P
       return;
     }
 
-    const vendor = await VendorFactory.getServiceByProviderCode((game as any).Product.providerCode, (game as any).id);
+    const providerCode = (game as any)?.Product?.providerCode;
+    const vendor = await VendorFactory.getServiceByProviderCode(providerCode, (game as any).id);
     if (!vendor) {
       sendError(res, 'Code808', 400);
       return;
     }
 
     const baseAccountId = String((player as any).player_game_id || '').trim();
+    const jokerSubBrandCode = isJokerProviderCode(providerCode)
+      ? String((await SubBrand.findOne({
+        where: { id: scope.sub_brand_id, tenant_id: scope.tenant_id } as any,
+        attributes: ['code'],
+      } as any) as any)?.code || '')
+      : '';
     const attemptedIds: string[] = [];
     const candidates = new Set<string>();
-    let finalAccountId = baseAccountId;
+    let finalAccountId = generateInitialVendorAccountId(providerCode, baseAccountId, jokerSubBrandCode);
     let result: any = null;
     let created = false;
 
     for (let attempt = 0; attempt < 10; attempt++) {
       const candidate =
         attempt === 0 ? finalAccountId : (() => {
-          let next = generateConflictAccountId(baseAccountId);
+          let next = generateNextVendorAccountId(providerCode, baseAccountId, jokerSubBrandCode);
           let guard = 0;
           while (candidates.has(next) && guard < 10) {
-            next = generateConflictAccountId(baseAccountId);
+            next = generateNextVendorAccountId(providerCode, baseAccountId, jokerSubBrandCode);
             guard++;
           }
           return next;
@@ -1388,6 +1444,9 @@ export const retryCreateGameAccount = async (req: AuthRequest, res: Response): P
       (result as any)?.raw?.data?.Data?.Username ||
       (result as any)?.raw?.data?.Username ||
       finalAccountId;
+    const displayAccountId = isJokerProviderCode(providerCode)
+      ? getJokerDisplayAccountId(providerUsername)
+      : undefined;
     const FIXED_PASSWORD = 'Abcd12345';
     const pwdResult = await vendor.setPlayerPassword(providerUsername, FIXED_PASSWORD);
     const password = pwdResult.success ? FIXED_PASSWORD : undefined;
@@ -1397,6 +1456,7 @@ export const retryCreateGameAccount = async (req: AuthRequest, res: Response): P
       .concat({
         gameName,
         accountId: providerUsername,
+        displayAccountId,
         password,
         provisioningStatus: 'CREATED',
         attemptedIds,
@@ -1413,7 +1473,7 @@ export const retryCreateGameAccount = async (req: AuthRequest, res: Response): P
     );
 
     sendSuccess(res, 'Code1', {
-      gameAccount: { gameName, accountId: providerUsername, password, provisioningStatus: 'CREATED', attemptedIds },
+      gameAccount: { gameName, accountId: providerUsername, displayAccountId, password, provisioningStatus: 'CREATED', attemptedIds },
       idempotent: false,
       passwordSet: pwdResult.success,
       vendorRaw: includeVendorRaw ? (result as any)?.raw : undefined,
@@ -1463,7 +1523,8 @@ export const recreateGameAccount = async (req: AuthRequest, res: Response): Prom
       return;
     }
 
-    const vendor = await VendorFactory.getServiceByProviderCode((game as any).Product.providerCode, (game as any).id);
+    const providerCode = (game as any)?.Product?.providerCode;
+    const vendor = await VendorFactory.getServiceByProviderCode(providerCode, (game as any).id);
     if (!vendor) {
       sendError(res, 'Code808', 400);
       return;
@@ -1480,22 +1541,28 @@ export const recreateGameAccount = async (req: AuthRequest, res: Response): Prom
     }
 
     const baseAccountId = String((player as any).player_game_id || '').trim();
+    const jokerSubBrandCode = isJokerProviderCode(providerCode)
+      ? String((await SubBrand.findOne({
+        where: { id: scope.sub_brand_id, tenant_id: scope.tenant_id } as any,
+        attributes: ['code'],
+      } as any) as any)?.code || '')
+      : '';
     const attemptedIds: string[] = [];
     const candidates = new Set<string>();
     for (const id of previousAttemptedIds) candidates.add(String(id || '').trim());
     if (previousAccountId) candidates.add(previousAccountId);
 
-    let finalAccountId = baseAccountId;
+    let finalAccountId = generateInitialVendorAccountId(providerCode, baseAccountId, jokerSubBrandCode);
     let result: any = null;
     let created = false;
 
     for (let attempt = 0; attempt < 10; attempt++) {
       const candidate =
         attempt === 0 ? finalAccountId : (() => {
-          let next = generateConflictAccountId(baseAccountId);
+          let next = generateNextVendorAccountId(providerCode, baseAccountId, jokerSubBrandCode);
           let guard = 0;
           while (candidates.has(next) && guard < 20) {
-            next = generateConflictAccountId(baseAccountId);
+            next = generateNextVendorAccountId(providerCode, baseAccountId, jokerSubBrandCode);
             guard++;
           }
           return next;
@@ -1529,6 +1596,9 @@ export const recreateGameAccount = async (req: AuthRequest, res: Response): Prom
       (result as any)?.raw?.data?.Data?.Username ||
       (result as any)?.raw?.data?.Username ||
       finalAccountId;
+    const displayAccountId = isJokerProviderCode(providerCode)
+      ? getJokerDisplayAccountId(providerUsername)
+      : undefined;
     const FIXED_PASSWORD = 'Abcd12345';
     const pwdResult = await vendor.setPlayerPassword(providerUsername, FIXED_PASSWORD);
     const password = pwdResult.success ? FIXED_PASSWORD : undefined;
@@ -1538,6 +1608,7 @@ export const recreateGameAccount = async (req: AuthRequest, res: Response): Prom
       .concat({
         gameName,
         accountId: providerUsername,
+        displayAccountId,
         password,
         provisioningStatus: 'CREATED',
         attemptedIds: (previousAccountId ? [previousAccountId].concat(previousAttemptedIds, attemptedIds) : previousAttemptedIds.concat(attemptedIds)).filter(Boolean),
@@ -1554,7 +1625,7 @@ export const recreateGameAccount = async (req: AuthRequest, res: Response): Prom
     );
 
     sendSuccess(res, 'Code1', {
-      gameAccount: { gameName, accountId: providerUsername, password, provisioningStatus: 'CREATED', attemptedIds },
+      gameAccount: { gameName, accountId: providerUsername, displayAccountId, password, provisioningStatus: 'CREATED', attemptedIds },
       previousAccountId: previousAccountId || null,
       disabledOk,
       passwordSet: pwdResult.success,
@@ -1606,6 +1677,15 @@ export const syncActiveGameAccounts = async (req: AuthRequest, res: Response) =>
     ]);
 
     const baseAccountId = String((player as any).player_game_id || '').trim();
+    const hasJokerGame = (activeApiGames as any[]).some((game) =>
+      isJokerProviderCode((game as any)?.Product?.providerCode),
+    );
+    const jokerSubBrandCode = hasJokerGame
+      ? String((await SubBrand.findOne({
+        where: { id: scope.sub_brand_id, tenant_id: scope.tenant_id } as any,
+        attributes: ['code'],
+      } as any) as any)?.code || '')
+      : '';
     const FIXED_PASSWORD = 'Abcd12345';
     const includeVendorRaw = Boolean((req as any)?.user?.is_super_admin);
     const refreshWalletCredit =
@@ -1669,17 +1749,17 @@ export const syncActiveGameAccounts = async (req: AuthRequest, res: Response) =>
 
       const attemptedIds: string[] = [];
       const candidates = new Set<string>();
-      let finalAccountId = baseAccountId;
+      let finalAccountId = generateInitialVendorAccountId(providerCode, baseAccountId, jokerSubBrandCode);
       let result: any = null;
       let created = false;
 
       for (let attempt = 0; attempt < 10; attempt++) {
         const candidate =
           attempt === 0 ? finalAccountId : (() => {
-            let next = generateConflictAccountId(baseAccountId);
+            let next = generateNextVendorAccountId(providerCode, baseAccountId, jokerSubBrandCode);
             let guard = 0;
             while (candidates.has(next) && guard < 10) {
-              next = generateConflictAccountId(baseAccountId);
+              next = generateNextVendorAccountId(providerCode, baseAccountId, jokerSubBrandCode);
               guard++;
             }
             return next;
@@ -1727,6 +1807,9 @@ export const syncActiveGameAccounts = async (req: AuthRequest, res: Response) =>
         (result as any)?.raw?.data?.Data?.Username ||
         (result as any)?.raw?.data?.Username ||
         finalAccountId;
+      const displayAccountId = isJokerProviderCode(providerCode)
+        ? getJokerDisplayAccountId(providerUsername)
+        : undefined;
       const createdNow =
         (result as any)?.status === 'Created' ||
         (result as any)?.code === 'CREATED' ||
@@ -1738,11 +1821,12 @@ export const syncActiveGameAccounts = async (req: AuthRequest, res: Response) =>
       newAccounts.push({
         gameName,
         accountId: providerUsername,
+        displayAccountId,
         password,
         provisioningStatus: 'CREATED',
         attemptedIds,
       });
-      results.push({ gameName, use_api: true, action: 'CREATED', accountId: providerUsername, attemptedIds, passwordSet: pwdResult.success, vendorRaw: includeVendorRaw ? (result as any)?.raw : undefined, vendorPasswordRaw: includeVendorRaw ? (pwdResult as any)?.raw : undefined });
+      results.push({ gameName, use_api: true, action: 'CREATED', accountId: providerUsername, displayAccountId, attemptedIds, passwordSet: pwdResult.success, vendorRaw: includeVendorRaw ? (result as any)?.raw : undefined, vendorPasswordRaw: includeVendorRaw ? (pwdResult as any)?.raw : undefined });
       existingGameNames.add(key);
     };
 
@@ -2011,6 +2095,7 @@ export const createPlayer = async (req: AuthRequest, res: Response): Promise<voi
       error?: string;
       passwordSet?: boolean;
       password?: string;
+      displayAccountId?: string;
       provisioningStatus: 'CREATED' | 'NON_API' | 'SKIPPED_CONFLICT' | 'PENDING_RETRY';
       attemptedIds?: string[];
     }> = [];
@@ -2030,9 +2115,10 @@ export const createPlayer = async (req: AuthRequest, res: Response): Promise<voi
       }
 
       try {
+        const providerCode = (game as any)?.Product?.providerCode;
         // 获取供应商服务
         const vendor = await VendorFactory.getServiceByProviderCode(
-          (game as any).Product.providerCode,
+          providerCode,
           game.id
         );
 
@@ -2052,17 +2138,17 @@ export const createPlayer = async (req: AuthRequest, res: Response): Promise<voi
         const baseAccountId = String(finalPlayerId || '').trim();
         const attemptedIds: string[] = [];
         const candidates = new Set<string>();
-        let finalAccountId = String(accountId || baseAccountId).trim();
-        if (!finalAccountId) finalAccountId = baseAccountId;
+        const requestedAccountId = String(accountId || baseAccountId).trim() || baseAccountId;
+        let finalAccountId = generateInitialVendorAccountId(providerCode, requestedAccountId, rawPrefix);
         let result: any = null;
         let created = false;
         for (let attempt = 0; attempt < 10; attempt++) {
           const candidate =
             attempt === 0 ? finalAccountId : (() => {
-              let next = generateConflictAccountId(baseAccountId);
+              let next = generateNextVendorAccountId(providerCode, baseAccountId, rawPrefix);
               let guard = 0;
               while (candidates.has(next) && guard < 10) {
-                next = generateConflictAccountId(baseAccountId);
+                next = generateNextVendorAccountId(providerCode, baseAccountId, rawPrefix);
                 guard++;
               }
               return next;
@@ -2116,6 +2202,9 @@ export const createPlayer = async (req: AuthRequest, res: Response): Promise<voi
           (result as any)?.raw?.data?.Data?.Username ||
           (result as any)?.raw?.data?.Username ||
           finalAccountId;
+        const displayAccountId = isJokerProviderCode(providerCode)
+          ? getJokerDisplayAccountId(providerUsername)
+          : undefined;
         if (result?.success) {
           const FIXED_PASSWORD = 'Abcd12345';
           const pwdResult = await vendor.setPlayerPassword(providerUsername, FIXED_PASSWORD);
@@ -2129,6 +2218,7 @@ export const createPlayer = async (req: AuthRequest, res: Response): Promise<voi
         vendorResults.push({
           gameName: gameName,
           accountId: providerUsername,
+          displayAccountId,
           success: true,
           error: undefined,
           passwordSet,
@@ -2184,6 +2274,7 @@ export const createPlayer = async (req: AuthRequest, res: Response): Promise<voi
     const createdGameAccounts = vendorResults.map((r) => ({
       gameName: r.gameName,
       accountId: r.accountId,
+      displayAccountId: r.displayAccountId,
       password: r.password,
       provisioningStatus: r.provisioningStatus,
       attemptedIds: r.attemptedIds,
@@ -2219,7 +2310,7 @@ export const createPlayer = async (req: AuthRequest, res: Response): Promise<voi
         .filter((r: any) => r.password)
         .map((r: any) => ({
           gameName: r.gameName,
-          username: r.accountId,
+          username: r.displayAccountId || r.accountId,
           password: r.password,
         })),
       vendorResults: vendorResults.map((r) => ({

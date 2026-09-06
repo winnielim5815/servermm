@@ -1,0 +1,27 @@
+import { randomInt } from 'crypto';
+
+export const JOKER_ACCOUNT_ID_DIGITS = 10;
+
+export const getJokerSubBrandPrefix = (subBrandCode: unknown): string => {
+  const normalized = typeof subBrandCode === 'string'
+    ? subBrandCode.trim().toUpperCase().replace(/[^A-Z0-9]/g, '')
+    : '';
+
+  return normalized.length >= 2 ? normalized.slice(0, 2) : 'SB';
+};
+
+export const generateJokerAccountId = (subBrandCode: unknown): string => {
+  let digits = '';
+  for (let index = 0; index < JOKER_ACCOUNT_ID_DIGITS; index++) {
+    digits += String(randomInt(0, 10));
+  }
+  return `${getJokerSubBrandPrefix(subBrandCode)}${digits}`;
+};
+
+export const getJokerDisplayAccountId = (providerUsername: unknown): string => {
+  const normalized = typeof providerUsername === 'string' ? providerUsername.trim() : '';
+  if (!normalized.includes('.')) return normalized;
+
+  const parts = normalized.split('.').filter(Boolean);
+  return parts.length > 0 ? parts[parts.length - 1] : normalized;
+};

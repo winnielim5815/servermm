@@ -4,6 +4,7 @@ import sequelize from '../config/database';
 import { Game, GameLog, GameLogSyncState, Player, Product } from '../models';
 import { VendorFactory } from './vendor/VendorFactory';
 import { normalizeVendorGameLogPage } from './gameLogNormalize';
+import { getGameLogPlayerAliases } from './gameLogPlayerAliases';
 
 const BACKGROUND_INTERVAL_MS = 30 * 60 * 1000;
 const RETENTION_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -128,23 +129,17 @@ const acquireLease = async (state: GameLogSyncState, owner: string, attemptedAt:
   return updated === 1;
 };
 
-const loadAllowedPlayers = async (scope: Scope, usernames: string[]) => {
-  const unique = Array.from(new Set(usernames.filter(Boolean)));
+const loadAllowedPlayers = async (scope: Scope, gameName: string) => {
   const playerByUsername = new Map<string, number>();
-  for (let index = 0; index < unique.length; index += 800) {
-    const chunk = unique.slice(index, index + 800);
-    const players = await Player.findAll({
-      attributes: ['id', 'player_game_id'],
-      where: {
-        ...scopeWhere(scope),
-        player_game_id: { [Op.in]: chunk },
-      } as any,
-      raw: true,
-    } as any);
-    for (const player of players as any[]) {
-      const username = String(player?.player_game_id ?? '').trim();
-      const id = Number(player?.id ?? 0);
-      if (username && Number.isFinite(id) && id > 0) playerByUsername.set(username.toUpperCase(), id);
+  const players = await Player.findAll({
+    attributes: ['id', 'player_game_id', 'metadata'],
+    where: scopeWhere(scope) as any,
+  } as any);
+  for (const player of players as any[]) {
+    const id = Number(player?.id ?? 0);
+    if (!Number.isFinite(id) || id <= 0) continue;
+    for (const alias of getGameLogPlayerAliases(player, gameName)) {
+      playerByUsername.set(alias, id);
     }
   }
   return playerByUsername;
@@ -155,11 +150,11 @@ const persistPage = async (
   scope: Scope,
   gameId: number,
   providerLabel: string,
+  playerByUsername: Map<string, number>,
 ) => {
   const normalized = normalizeVendorGameLogPage(response);
   if (normalized.length === 0) return 0;
 
-  const playerByUsername = await loadAllowedPlayers(scope, normalized.map((row) => row.player));
   const now = new Date();
   const records = normalized.flatMap((row) => {
     const playerId = playerByUsername.get(row.player.toUpperCase());
@@ -255,6 +250,7 @@ const runGameSyncInternal = async (game: Game, scope: Scope): Promise<GameLogSyn
     const productId = Number((game as any).product_id ?? 0);
     const product = productId > 0 ? await Product.findByPk(productId as any) : null;
     const providerLabel = String((product as any)?.provider ?? (game as any).name ?? 'Vendor');
+    const playerByUsername = await loadAllowedPlayers(scope, String((game as any).name || ''));
     const collectionStart = asDate((state as any).collection_started_at, now);
     const targetEnd = ceilMinute(now);
 
@@ -289,7 +285,7 @@ const runGameSyncInternal = async (game: Game, scope: Scope): Promise<GameLogSyn
           throw new Error(response?.error || response?.message || 'Vendor rejected game log sync');
         }
 
-        await persistPage(response, scope, gameId, providerLabel);
+        await persistPage(response, scope, gameId, providerLabel, playerByUsername);
         pages += 1;
         nextId = response?.nextId ? String(response.nextId) : '';
         await GameLogSyncState.update(
@@ -386,6 +382,19 @@ const runWithConcurrency = async (games: Game[], concurrency = 3) => {
 export const syncGameLogsForScope = async (scope: Scope, gameId?: number | null) => {
   await ensureGameLogStorage();
   const games = await loadSyncableGames(scope, gameId);
+  return runWithConcurrency(games);
+};
+
+export const syncGameLogsForTenant = async (tenantId: number) => {
+  await ensureGameLogStorage();
+  const games = await Game.findAll({
+    where: {
+      tenant_id: tenantId,
+      use_api: true,
+      status: 'active',
+    },
+    order: [['id', 'ASC']],
+  } as any);
   return runWithConcurrency(games);
 };
 

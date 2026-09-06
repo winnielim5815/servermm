@@ -8,7 +8,7 @@ import { getTenancyScopeOrThrow, withTenancyWhere } from '../tenancy/scope';
 import { sendError, sendSuccess } from '../utils/response';
 import { getClientIp, logAudit } from '../services/AuditService';
 import { getCache, setCache } from '../services/CacheService';
-import { getGameLogSyncSummary, syncGameLogsForScope } from '../services/GameLogSyncService';
+import { getGameLogSyncSummary, syncGameLogsForScope, syncGameLogsForTenant } from '../services/GameLogSyncService';
 
 let reportTransactionsSynced = false;
 const ensureReportTransactionsSynced = async () => {
@@ -397,13 +397,24 @@ export const getSubBrandWinLossReport = async (req: AuthRequest, res: Response) 
       }
     }
 
+    const shouldRefreshGameLogs = String(req.query.refresh ?? 'true').trim().toLowerCase() !== 'false';
+    let gameLogSyncFailed = false;
+    if (shouldRefreshGameLogs) {
+      try {
+        const results = await syncGameLogsForTenant(effectiveTenantId);
+        gameLogSyncFailed = results.some((result) => !result.success);
+      } catch {
+        gameLogSyncFailed = true;
+      }
+    }
+
     const cacheKey = [
-      'subbrand_winloss_v1',
+      'subbrand_winloss_v2',
       effectiveTenantId,
       startDate.toISOString(),
       endDate.toISOString(),
     ].join(':');
-    const cached = getCache(cacheKey);
+    const cached = shouldRefreshGameLogs ? null : getCache(cacheKey);
     if (cached) {
       res.setHeader('Cache-Control', 'private, max-age=3');
       return sendSuccess(res, 'Code1', cached);
@@ -464,14 +475,50 @@ export const getSubBrandWinLossReport = async (req: AuthRequest, res: Response) 
       ORDER BY sb.id ASC
     `;
 
-    const rowsRaw = (await sequelize.query(sql, {
+    const gameSql = `
+      SELECT
+        g.sub_brand_id AS subBrandId,
+        g.id AS gameId,
+        g.name AS gameName,
+        g.icon AS gameIcon,
+        COALESCE(SUM(gl.result_amount - gl.amount), 0) AS winLose
+      FROM games g
+      LEFT JOIN game_logs gl
+        ON gl.tenant_id = g.tenant_id
+        AND gl.sub_brand_id = g.sub_brand_id
+        AND gl.game_id = g.id
+        AND gl.occurred_at BETWEEN :startAt AND :endAt
+      WHERE g.tenant_id = :tenantId
+      GROUP BY g.sub_brand_id, g.id, g.name
+      ORDER BY g.sub_brand_id ASC, g.name ASC, g.id ASC
+    `;
+
+    const queryOptions = {
       replacements: {
         tenantId: effectiveTenantId,
         startAt: startAtSql,
         endAt: endAtSql,
       },
       type: QueryTypes.SELECT,
-    })) as any[];
+    } as const;
+    const [rowsRaw, gameRowsRaw] = await Promise.all([
+      sequelize.query(sql, queryOptions) as Promise<any[]>,
+      sequelize.query(gameSql, queryOptions) as Promise<any[]>,
+    ]);
+
+    const gamesBySubBrand = new Map<number, Array<{ gameId: number; gameName: string | null; gameIcon: string | null; winLose: number }>>();
+    for (const gameRow of gameRowsRaw) {
+      const subBrandId = Number((gameRow as any).subBrandId || 0);
+      if (!subBrandId) continue;
+      const games = gamesBySubBrand.get(subBrandId) || [];
+      games.push({
+        gameId: Number((gameRow as any).gameId || 0),
+        gameName: (gameRow as any).gameName || null,
+        gameIcon: (gameRow as any).gameIcon || null,
+        winLose: toFiniteNumber((gameRow as any).winLose),
+      });
+      gamesBySubBrand.set(subBrandId, games);
+    }
 
     const rows = rowsRaw.map((r) => {
       const deposit = toFiniteNumber((r as any).deposit);
@@ -484,8 +531,11 @@ export const getSubBrandWinLossReport = async (req: AuthRequest, res: Response) 
       const balance = deposit + bonus - withdraw - tips - waive;
       const netDeposit = deposit - withdraw - bonus + waive;
       const winPct = deposit ? (netDeposit / deposit) * 100 : 0;
+      const subBrandId = Number((r as any).subBrandId || 0);
+      const games = gamesBySubBrand.get(subBrandId) || [];
+      const winLose = games.reduce((sum, game) => sum + game.winLose, 0);
       return {
-        subBrandId: Number((r as any).subBrandId || 0),
+        subBrandId,
         subBrandName: (r as any).subBrandName || null,
         depositQty: Number((r as any).depositQty || 0),
         deposit,
@@ -499,7 +549,9 @@ export const getSubBrandWinLossReport = async (req: AuthRequest, res: Response) 
         balance,
         netDeposit,
         winPct,
+        winLose,
         playerQty: Number((r as any).playerQty || 0),
+        games,
       };
     });
 
@@ -515,6 +567,7 @@ export const getSubBrandWinLossReport = async (req: AuthRequest, res: Response) 
         a.bankAdjustment += r.bankAdjustment;
         a.gameAdjustment += r.gameAdjustment;
         a.balance += r.balance;
+        a.winLose += r.winLose;
         a.playerQty += r.playerQty;
         return a;
       },
@@ -529,10 +582,11 @@ export const getSubBrandWinLossReport = async (req: AuthRequest, res: Response) 
         bankAdjustment: 0,
         gameAdjustment: 0,
         balance: 0,
+        winLose: 0,
         playerQty: 0,
       },
     );
-    const payload = { generatedAt: new Date().toISOString(), rows, totals };
+    const payload = { generatedAt: new Date().toISOString(), rows, totals, gameLogSyncFailed };
     setCache(cacheKey, payload, 3);
     res.setHeader('Cache-Control', 'private, max-age=3');
     return sendSuccess(res, 'Code1', payload);
