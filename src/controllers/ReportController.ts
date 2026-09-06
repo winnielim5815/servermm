@@ -961,14 +961,29 @@ export const getPlayerGameLogReport = async (req: AuthRequest, res: Response): P
       occurred_at: { [Op.between]: [start, end] },
     } as any);
     if (normalizedGameId) where.game_id = normalizedGameId;
-    if (uname) where.player = uname;
+    if (uname) {
+      const matchedPlayer = await Player.findOne({
+        attributes: ['id'],
+        where: withTenancyWhere(scope, { player_game_id: uname } as any),
+        raw: true,
+      } as any) as any;
+      where.player_id = matchedPlayer?.id != null ? Number(matchedPlayer.id) : -1;
+    }
+
+    const playerJoin = () => ({
+      model: Player,
+      attributes: [],
+      required: true,
+      where: withTenancyWhere(scope) as any,
+    });
 
     const [result, totalsRow, syncSummary] = await Promise.all([
       GameLog.findAndCountAll({
         where,
+        include: [playerJoin()],
         attributes: [
           'id',
-          'player',
+          [sequelize.col('Player.player_game_id'), 'system_player_id'],
           'game_id',
           'vendor_transaction_id',
           'round_id',
@@ -989,6 +1004,7 @@ export const getPlayerGameLogReport = async (req: AuthRequest, res: Response): P
       } as any),
       GameLog.findOne({
         where,
+        include: [playerJoin()],
         attributes: [
           [sequelize.fn('COALESCE', sequelize.fn('SUM', sequelize.col('start_balance')), 0), 'start_balance'],
           [sequelize.fn('COALESCE', sequelize.fn('SUM', sequelize.col('end_balance')), 0), 'end_balance'],
@@ -1010,7 +1026,7 @@ export const getPlayerGameLogReport = async (req: AuthRequest, res: Response): P
     const totalItems = Number(result.count ?? 0) || 0;
     const rows = (result.rows as any[]).map((row) => ({
       id: String(row.id),
-      player: String(row.player ?? ''),
+      player: String(row.system_player_id ?? ''),
       game_id: row.game_id != null ? Number(row.game_id) : null,
       ocode: row.vendor_transaction_id ?? null,
       round_id: row.round_id ?? null,
