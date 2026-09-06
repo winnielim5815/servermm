@@ -10,7 +10,7 @@ import {
 import { BaseVendorService } from '../BaseVendorService';
 import Game from '../../../models/Game';
 import { decrypt, isEncrypted } from '../../../utils/encryption';
-import { normalizeJokerAppId } from '../jokerAccountId';
+import { getJokerUsernameWithoutAppId, normalizeJokerAppId } from '../jokerAccountId';
 
 const toNumber = (v: any): number | undefined => {
   if (typeof v === 'number' && Number.isFinite(v)) return v;
@@ -134,7 +134,7 @@ export class JokerVendorService extends BaseVendorService implements VendorServi
   async createPlayer(username: string): Promise<VendorResult> {
     try {
       const provider = await this.initProvider();
-      const result = await provider.createPlayer(username);
+      const result = await provider.createPlayer(getJokerUsernameWithoutAppId(username));
 
       if (!result.success) {
         return {
@@ -169,7 +169,7 @@ export class JokerVendorService extends BaseVendorService implements VendorServi
   async setPlayerStatus(username: string, status: 'Active' | 'Suspend'): Promise<VendorResult> {
     try {
       const provider = await this.initProvider();
-      const result = await provider.setPlayerStatus(username, status);
+      const result = await provider.setPlayerStatus(getJokerUsernameWithoutAppId(username), status);
 
       if (!result.success) {
         return {
@@ -193,7 +193,7 @@ export class JokerVendorService extends BaseVendorService implements VendorServi
   async setPlayerPassword(username: string, password: string): Promise<VendorResult> {
     try {
       const provider = await this.initProvider();
-      const result = await provider.setPlayerPassword(username, password);
+      const result = await provider.setPlayerPassword(getJokerUsernameWithoutAppId(username), password);
 
       if (!result.success) {
         return {
@@ -217,7 +217,7 @@ export class JokerVendorService extends BaseVendorService implements VendorServi
   async logoutPlayer(username: string): Promise<VendorResult> {
     try {
       const provider = await this.initProvider();
-      const result = await provider.logoutPlayer(username);
+      const result = await provider.logoutPlayer(getJokerUsernameWithoutAppId(username));
 
       if (!result.success) {
         return {
@@ -244,7 +244,7 @@ export class JokerVendorService extends BaseVendorService implements VendorServi
   async getBalance(username: string): Promise<VendorBalanceResult> {
     try {
       const provider = await this.initProvider();
-      const result = await provider.getCredit(username);
+      const result = await provider.getCredit(getJokerUsernameWithoutAppId(username));
 
       if (!result.success) {
         return {
@@ -282,7 +282,7 @@ export class JokerVendorService extends BaseVendorService implements VendorServi
 
       const reqId = requestId || this.generateRequestId();
       const provider = await this.initProvider();
-      const result = await provider.transferCredit(username, amount, reqId);
+      const result = await provider.transferCredit(getJokerUsernameWithoutAppId(username), amount, reqId);
 
       if (!result.success) {
         return {
@@ -321,7 +321,7 @@ export class JokerVendorService extends BaseVendorService implements VendorServi
 
       const reqId = requestId || this.generateRequestId();
       const provider = await this.initProvider();
-      const result = await provider.transferCredit(username, -amount, reqId);
+      const result = await provider.transferCredit(getJokerUsernameWithoutAppId(username), -amount, reqId);
 
       if (!result.success) {
         return {
@@ -356,7 +356,7 @@ export class JokerVendorService extends BaseVendorService implements VendorServi
     try {
       const reqId = requestId || this.generateRequestId();
       const provider = await this.initProvider();
-      const result = await provider.withdrawAll(username, reqId);
+      const result = await provider.withdrawAll(getJokerUsernameWithoutAppId(username), reqId);
 
       if (!result.success) {
         return {
@@ -395,7 +395,7 @@ export class JokerVendorService extends BaseVendorService implements VendorServi
   ): Promise<VendorLaunchResult> {
     try {
       const provider = await this.initProvider();
-      const result = await provider.launchGame(username, gameCode, {
+      const result = await provider.launchGame(getJokerUsernameWithoutAppId(username), gameCode, {
         mode: options?.mode,
         amount: options?.amount,
         language: options?.language || 'zh',
@@ -574,7 +574,11 @@ export class JokerVendorService extends BaseVendorService implements VendorServi
   ): Promise<VendorResult & { winloss?: any[] }> {
     try {
       const provider = await this.initProvider();
-      const result = await provider.getWinloss(startDate, endDate, username);
+      const result = await provider.getWinloss(
+        startDate,
+        endDate,
+        username ? getJokerUsernameWithoutAppId(username) : undefined
+      );
 
       if (!result.success) {
         return {

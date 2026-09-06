@@ -31,6 +31,7 @@ describe('Joker account ID', () => {
 
   it('extracts the unqualified username only for API normalization', () => {
     expect(getJokerUsernameWithoutAppId('APPID.AB1234567890')).toBe('AB1234567890');
+    expect(getJokerUsernameWithoutAppId('FVNM.FVNM.SP3602436765')).toBe('SP3602436765');
     expect(getJokerUsernameWithoutAppId('AB1234567890')).toBe('AB1234567890');
   });
 
