@@ -12,7 +12,14 @@ const RETENTION_DAYS = 365;
 const OVERLAP_MS = 60 * 60 * 1000;
 const MAX_WINDOW_MS = 24 * 60 * 60 * 1000;
 const LEASE_MS = 10 * 60 * 1000;
-const MAX_PAGES_PER_RUN = 5000;
+// Game log collection shares the same Node process and database pool as the API.
+// Keep background work deliberately small so normal requests always have capacity.
+const MAX_PAGES_PER_RUN = 250;
+const PLAYER_READ_BATCH_SIZE = 250;
+const GAME_LOG_WRITE_BATCH_SIZE = 200;
+const PLAYER_ALIAS_BATCH_SIZE = 500;
+const PAGE_PAUSE_MS = 25;
+const BACKGROUND_CONCURRENCY = 1;
 
 type Scope = { tenant_id: number | null; sub_brand_id: number | null };
 
@@ -27,6 +34,15 @@ const activeSyncs = new Map<string, Promise<GameLogSyncResult>>();
 let scheduler: NodeJS.Timeout | null = null;
 let retentionScheduler: NodeJS.Timeout | null = null;
 let storageReady: Promise<void> | null = null;
+let scheduledSync: Promise<void> | null = null;
+
+const yieldToOtherWork = (delayMs = 0) => new Promise<void>((resolve) => {
+  if (delayMs > 0) {
+    setTimeout(resolve, delayMs);
+    return;
+  }
+  setImmediate(resolve);
+});
 
 const asDate = (value: any, fallback = new Date()): Date => {
   let normalized = value;
@@ -129,18 +145,44 @@ const acquireLease = async (state: GameLogSyncState, owner: string, attemptedAt:
   return updated === 1;
 };
 
-const loadAllowedPlayers = async (scope: Scope, gameName: string) => {
+const loadPlayersForScope = async (scope: Scope) => {
+  const players: any[] = [];
+  let lastId = 0;
+
+  for (;;) {
+    const batch = await Player.findAll({
+      attributes: ['id', 'player_game_id', 'metadata'],
+      where: {
+        ...scopeWhere(scope),
+        id: { [Op.gt]: lastId },
+      } as any,
+      order: [['id', 'ASC']],
+      limit: PLAYER_READ_BATCH_SIZE,
+    } as any) as any[];
+
+    if (batch.length === 0) break;
+    for (const player of batch) {
+      const plain = typeof player?.get === 'function' ? player.get({ plain: true }) : player;
+      players.push(plain);
+      lastId = Math.max(lastId, Number(plain?.id ?? 0));
+    }
+    if (batch.length < PLAYER_READ_BATCH_SIZE) break;
+    await yieldToOtherWork();
+  }
+
+  return players;
+};
+
+const loadAllowedPlayers = async (players: any[], gameName: string) => {
   const playerByUsername = new Map<string, number>();
-  const players = await Player.findAll({
-    attributes: ['id', 'player_game_id', 'metadata'],
-    where: scopeWhere(scope) as any,
-  } as any);
-  for (const player of players as any[]) {
+  for (let index = 0; index < players.length; index++) {
+    const player = players[index];
     const id = Number(player?.id ?? 0);
     if (!Number.isFinite(id) || id <= 0) continue;
     for (const alias of getGameLogPlayerAliases(player, gameName)) {
       playerByUsername.set(alias, id);
     }
+    if ((index + 1) % PLAYER_ALIAS_BATCH_SIZE === 0) await yieldToOtherWork();
   }
   return playerByUsername;
 };
@@ -192,37 +234,45 @@ const persistPage = async (
   });
 
   if (records.length === 0) return 0;
-  await GameLog.bulkCreate(records as any[], {
-    updateOnDuplicate: [
-      'player_id',
-      'player',
-      'transaction_ocode',
-      'round_id',
-      'game_code',
-      'vendor_category',
-      'game_provider',
-      'game_name',
-      'game_category',
-      'description',
-      'transaction_type',
-      'currency_code',
-      'app_id',
-      'is_special',
-      'amount',
-      'free_amount',
-      'result_amount',
-      'start_balance',
-      'end_balance',
-      'occurred_at',
-      'raw_details',
-      'raw_payload',
-      'last_seen_at',
-    ],
-  } as any);
+  const updateOnDuplicate = [
+    'player_id',
+    'player',
+    'transaction_ocode',
+    'round_id',
+    'game_code',
+    'vendor_category',
+    'game_provider',
+    'game_name',
+    'game_category',
+    'description',
+    'transaction_type',
+    'currency_code',
+    'app_id',
+    'is_special',
+    'amount',
+    'free_amount',
+    'result_amount',
+    'start_balance',
+    'end_balance',
+    'occurred_at',
+    'raw_details',
+    'raw_payload',
+    'last_seen_at',
+  ];
+
+  for (let index = 0; index < records.length; index += GAME_LOG_WRITE_BATCH_SIZE) {
+    const batch = records.slice(index, index + GAME_LOG_WRITE_BATCH_SIZE);
+    await GameLog.bulkCreate(batch as any[], { updateOnDuplicate } as any);
+    await yieldToOtherWork();
+  }
   return records.length;
 };
 
-const runGameSyncInternal = async (game: Game, scope: Scope): Promise<GameLogSyncResult> => {
+const runGameSyncInternal = async (
+  game: Game,
+  scope: Scope,
+  loadPlayers: () => Promise<any[]>,
+): Promise<GameLogSyncResult> => {
   const gameId = Number((game as any).id);
   const service = await VendorFactory.getServiceByGame(gameId);
   if (!service || typeof (service as any).getTransactionsByMinute !== 'function') {
@@ -250,7 +300,10 @@ const runGameSyncInternal = async (game: Game, scope: Scope): Promise<GameLogSyn
     const productId = Number((game as any).product_id ?? 0);
     const product = productId > 0 ? await Product.findByPk(productId as any) : null;
     const providerLabel = String((product as any)?.provider ?? (game as any).name ?? 'Vendor');
-    const playerByUsername = await loadAllowedPlayers(scope, String((game as any).name || ''));
+    const playerByUsername = await loadAllowedPlayers(
+      await loadPlayers(),
+      String((game as any).name || ''),
+    );
     const collectionStart = asDate((state as any).collection_started_at, now);
     const targetEnd = ceilMinute(now);
 
@@ -296,6 +349,7 @@ const runGameSyncInternal = async (game: Game, scope: Scope): Promise<GameLogSyn
           { where: { id: state.id, lease_owner: owner } as any },
         );
         if (!nextId) break;
+        await yieldToOtherWork(PAGE_PAUSE_MS);
       }
 
       await GameLogSyncState.update(
@@ -309,6 +363,7 @@ const runGameSyncInternal = async (game: Game, scope: Scope): Promise<GameLogSyn
       );
       windowStart = windowEnd;
       savedWindowEnd = null;
+      await yieldToOtherWork(PAGE_PAUSE_MS);
     }
 
     await GameLogSyncState.update(
@@ -339,12 +394,12 @@ const runGameSyncInternal = async (game: Game, scope: Scope): Promise<GameLogSyn
   }
 };
 
-const runGameSync = (game: Game, scope: Scope) => {
+const runGameSync = (game: Game, scope: Scope, loadPlayers: () => Promise<any[]>) => {
   const gameId = Number((game as any).id);
   const key = syncKey(scope, gameId);
   const existing = activeSyncs.get(key);
   if (existing) return existing;
-  const pending = runGameSyncInternal(game, scope).finally(() => activeSyncs.delete(key));
+  const pending = runGameSyncInternal(game, scope, loadPlayers).finally(() => activeSyncs.delete(key));
   activeSyncs.set(key, pending);
   return pending;
 };
@@ -356,8 +411,15 @@ const loadSyncableGames = async (scope?: Scope, gameId?: number | null) => {
   return Game.findAll({ where, order: [['id', 'ASC']] } as any);
 };
 
-const runWithConcurrency = async (games: Game[], concurrency = 3) => {
+const runWithConcurrency = async (games: Game[], concurrency = BACKGROUND_CONCURRENCY) => {
   const results: GameLogSyncResult[] = [];
+  const playersByScope = new Map<string, Promise<any[]>>();
+  const remainingGamesByScope = new Map<string, number>();
+  for (const game of games as any[]) {
+    if (game?.tenant_id == null || game?.sub_brand_id == null) continue;
+    const key = `${Number(game.tenant_id)}:${Number(game.sub_brand_id)}`;
+    remainingGamesByScope.set(key, (remainingGamesByScope.get(key) || 0) + 1);
+  }
   let cursor = 0;
   const worker = async () => {
     for (;;) {
@@ -372,7 +434,26 @@ const runWithConcurrency = async (games: Game[], concurrency = 3) => {
         results.push({ gameId: Number(game.id), success: true, skipped: true });
         continue;
       }
-      results.push(await runGameSync(game, scope));
+      const playerScopeKey = `${scope.tenant_id}:${scope.sub_brand_id}`;
+      const loadPlayers = () => {
+        let pending = playersByScope.get(playerScopeKey);
+        if (!pending) {
+          pending = loadPlayersForScope(scope);
+          playersByScope.set(playerScopeKey, pending);
+        }
+        return pending;
+      };
+      try {
+        results.push(await runGameSync(game, scope, loadPlayers));
+      } finally {
+        const remaining = (remainingGamesByScope.get(playerScopeKey) || 1) - 1;
+        if (remaining <= 0) {
+          remainingGamesByScope.delete(playerScopeKey);
+          playersByScope.delete(playerScopeKey);
+        } else {
+          remainingGamesByScope.set(playerScopeKey, remaining);
+        }
+      }
     }
   };
   await Promise.all(Array.from({ length: Math.max(1, Math.min(concurrency, games.length || 1)) }, () => worker()));
@@ -462,10 +543,18 @@ export const purgeExpiredGameLogs = async () => {
 
 export const startGameLogSyncScheduler = () => {
   if (scheduler) return;
-  void syncAllGameLogs().catch((error) => console.error('Game log initial sync failed:', safeErrorMessage(error)));
+  const runScheduledSync = () => {
+    if (scheduledSync) return;
+    scheduledSync = syncAllGameLogs()
+      .then(() => undefined)
+      .catch((error) => console.error('Game log scheduled sync failed:', safeErrorMessage(error)))
+      .finally(() => {
+        scheduledSync = null;
+      });
+  };
   void purgeExpiredGameLogs().catch((error) => console.error('Game log retention cleanup failed:', safeErrorMessage(error)));
   scheduler = setInterval(() => {
-    void syncAllGameLogs().catch((error) => console.error('Game log scheduled sync failed:', safeErrorMessage(error)));
+    runScheduledSync();
   }, BACKGROUND_INTERVAL_MS);
   retentionScheduler = setInterval(() => {
     void purgeExpiredGameLogs().catch((error) => console.error('Game log retention cleanup failed:', safeErrorMessage(error)));
